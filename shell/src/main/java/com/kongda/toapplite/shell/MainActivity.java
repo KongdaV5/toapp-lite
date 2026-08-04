@@ -201,7 +201,7 @@ public final class MainActivity extends Activity {
             }
         });
 
-        webView.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+        webView.setDownloadListener((url, downloadUserAgent, contentDisposition, mimeType, contentLength) -> {
             try {
                 Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                 startActivity(intent);
