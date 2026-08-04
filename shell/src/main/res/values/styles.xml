@@ -1,0 +1,7 @@
+<resources>
+    <style name="ShellTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:colorAccent">#555555</item>
+    </style>
+</resources>
