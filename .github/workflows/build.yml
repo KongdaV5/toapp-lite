@@ -1,4 +1,4 @@
-name: Build ToApp Lite
+name: Build WebtoApp
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
         with:
           gradle-version: "9.5.0"
 
-      - name: Build debug APK
+      - name: Build WebtoApp APK
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Verify merged permissions
@@ -67,9 +67,12 @@ jobs:
             fi
           done
 
-      - name: Upload APK
+      - name: Prepare WebtoApp APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk WebtoApp.apk
+
+      - name: Upload WebtoApp APK
         uses: actions/upload-artifact@v4
         with:
-          name: ToApp-Lite-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: WebtoApp
+          path: WebtoApp.apk
           if-no-files-found: error
