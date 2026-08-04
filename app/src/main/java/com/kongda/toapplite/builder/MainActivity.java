@@ -83,7 +83,7 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        TextView title = text("ToApp Lite", 27f, Color.BLACK);
+        TextView title = text("WebtoApp", 27f, Color.BLACK);
         title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         content.addView(title);
 
@@ -177,7 +177,7 @@ public final class MainActivity extends Activity {
         content.addView(keyButtons);
 
         TextView limits = text(
-                "当前 Lite 版：仅支持 HTTPS；生成的应用不含统计 SDK、远程更新、广告、JS 桥、相机、麦克风或定位权限。网页文件上传通过安卓系统选择器完成。",
+                "当前 WebtoApp 版：仅支持 HTTPS；生成的应用不含统计 SDK、远程更新、广告、JS 桥、相机、麦克风或定位权限。图片和普通文件上传均通过安卓系统选择器完成。",
                 13f,
                 0xff666666
         );

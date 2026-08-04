@@ -165,7 +165,7 @@ final class SigningKeyManager {
                 Der.set(
                         Der.sequence(
                                 Der.oid("2.5.4.3"),
-                                Der.utf8String("ToApp Lite Local Signing")
+                                Der.utf8String("WebtoApp Local Signing")
                         )
                 )
         );

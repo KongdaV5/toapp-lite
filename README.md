@@ -1,4 +1,4 @@
-# ToApp Lite
+# WebtoApp
 
 一个**完全在安卓手机本地运行**的网页转 APK 工具。它不修改原 ToApp 成品包，也不复用原作者的统计、官网、更新或推广代码。
 
@@ -14,7 +14,7 @@
 
 ## 权限设计
 
-### ToApp Lite 生成器
+### WebtoApp 生成器
 
 最终 Manifest 应为 **0 个运行/敏感权限**，并且不包含：
 
@@ -46,7 +46,7 @@ WebView 默认：
 ## 工程结构
 
 ```text
-app/       ToApp Lite 生成器
+app/       WebtoApp 生成器
 shell/     自有的极简 WebView 模板
 ```
 
@@ -70,14 +70,14 @@ gradle :app:assembleDebug
 安装包输出：
 
 ```text
-app/build/outputs/apk/debug/app-debug.apk
+app/build/outputs/apk/debug/WebtoApp.apk
 ```
 
 仓库自带 `.github/workflows/build.yml`。推送到 GitHub 后，也可在 Actions 的构建产物中下载 APK。
 
 ## 使用
 
-1. 安装 `app-debug.apk`；
+1. 安装 `WebtoApp.apk`；
 2. 填写应用名称、唯一包名和 HTTPS 地址；
 3. 选择图标（可选）；
 4. 点击“生成并保存 APK”；
@@ -105,15 +105,15 @@ v0.1 模板版本固定为 `versionCode=1`，适合首次验证。下一版本�
 构建后建议执行：
 
 ```bash
-aapt2 dump permissions app-debug.apk
-apkanalyzer manifest permissions app-debug.apk
+aapt2 dump permissions WebtoApp.apk
+apkanalyzer manifest permissions WebtoApp.apk
 apkanalyzer manifest permissions generated.apk
 apksigner verify --verbose --print-certs generated.apk
 ```
 
 预期：
 
-- `app-debug.apk` 不含联网和敏感权限；
+- `WebtoApp.apk` 不含联网和敏感权限；
 - `generated.apk` 只有网络相关两项权限；
 - 源码及 APK 中不存在 `baidu.mobstat`、`seegood.top`、广告 SDK 或远程更新地址；
 - 生成器断网时仍可完成生成、签名和保存。
