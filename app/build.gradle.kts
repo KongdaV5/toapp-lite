@@ -4,12 +4,12 @@ plugins {
 
 android {
     namespace = "com.kongda.toapplite.builder"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.kongda.toapplite.builder"
         minSdk = 26
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
     }
