@@ -1,0 +1,7 @@
+ToApp Lite is an independent clean-room rewrite created for private/internal use.
+It does not contain code, assets, signing keys, analytics SDKs, or remote service
+integrations from the uploaded ToApp APK.
+
+Third-party dependency:
+- apksig-android by Muntashir Al-Islam / Android apksig-derived code.
+  Review its upstream license before redistribution.
