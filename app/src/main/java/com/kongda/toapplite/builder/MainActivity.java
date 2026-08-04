@@ -391,7 +391,7 @@ public final class MainActivity extends Activity {
                     Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
                     intent.addCategory(Intent.CATEGORY_OPENABLE);
                     intent.setType("application/x-pkcs12");
-                    intent.putExtra(Intent.EXTRA_TITLE, "toapp-lite-signing-backup.p12");
+                    intent.putExtra(Intent.EXTRA_TITLE, "WebtoApp-signing-backup.p12");
                     startActivityForResult(intent, EXPORT_KEY_REQUEST);
                 })
                 .show();

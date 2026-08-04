@@ -110,7 +110,14 @@ public final class MainActivity extends Activity {
                 android.graphics.Insets bars = insets.getInsets(
                         WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
                 );
-                view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
+
+                view.setPadding(
+                        bars.left,
+                        bars.top,
+                        bars.right,
+                        Math.max(bars.bottom, ime.bottom)
+                );
                 return insets;
             });
             root.post(root::requestApplyInsets);
