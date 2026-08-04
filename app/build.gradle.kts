@@ -38,7 +38,9 @@ val prepareTemplateApk by tasks.registering(Copy::class) {
     rename { "template.apk" }
 }
 
-android.sourceSets.getByName("main").assets.srcDir(generatedTemplateAssets)
+android.sourceSets.getByName("main").assets.srcDir(
+    generatedTemplateAssets.get().asFile
+)
 
 tasks.configureEach {
     if (name == "mergeDebugAssets" || name == "mergeReleaseAssets") {
