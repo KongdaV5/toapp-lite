@@ -60,8 +60,7 @@ public final class MainActivity extends Activity {
     private int touchSlop;
     private float touchStartX;
     private float touchStartY;
-    private float lastTouchY;
-    private float verticalAccumulator;
+    private boolean statusBarGestureHandled;
     private boolean statusBarHidden;
 
     private android.window.OnBackInvokedCallback backCallback;
@@ -292,70 +291,61 @@ public final class MainActivity extends Activity {
         webView.setOnTouchListener((view, event) -> {
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
-                    touchStartX = event.getX();
-                    touchStartY = event.getY();
-                    lastTouchY = event.getY();
-                    verticalAccumulator = 0f;
+                    // 使用屏幕绝对坐标，不受状态栏出现、页面重新布局影响。
+                    touchStartX = event.getRawX();
+                    touchStartY = event.getRawY();
+                    statusBarGestureHandled = false;
                     break;
 
                 case MotionEvent.ACTION_MOVE:
-                    float totalX = event.getX() - touchStartX;
-                    float totalY = event.getY() - touchStartY;
-                    float deltaY = event.getY() - lastTouchY;
-                    lastTouchY = event.getY();
+                    if (statusBarGestureHandled) {
+                        break;
+                    }
 
-                    // 只识别明显的纵向滑动，避免与侧边返回冲突。
-                    if (Math.abs(totalY) > Math.abs(totalX)) {
-                        if (deltaY < 0f) {
-                            // 手指向上滑：隐藏状态栏。
-                            if (verticalAccumulator > 0f) {
-                                verticalAccumulator = 0f;
-                            }
+                    float movedX = event.getRawX() - touchStartX;
+                    float movedY = event.getRawY() - touchStartY;
 
-                            verticalAccumulator += deltaY;
+                    // 只处理明显的纵向手势。
+                    if (Math.abs(movedY) > Math.abs(movedX)
+                            && Math.abs(movedY) >= gestureThreshold) {
 
-                            if (-verticalAccumulator >= gestureThreshold) {
-                                hideStatusBar();
-                                verticalAccumulator = 0f;
-                            }
-                        } else if (deltaY > 0f) {
-                            // 手指向下滑：恢复状态栏。
-                            if (verticalAccumulator < 0f) {
-                                verticalAccumulator = 0f;
-                            }
-
-                            verticalAccumulator += deltaY;
-
-                            if (verticalAccumulator >= gestureThreshold) {
-                                showStatusBar();
-                                verticalAccumulator = 0f;
-                            }
+                        if (movedY < 0f) {
+                            // 手指上滑：隐藏状态栏。
+                            hideStatusBar();
+                        } else {
+                            // 手指下滑：显示状态栏。
+                            showStatusBar();
                         }
+
+                        // 同一次手指按下过程中只允许切换一次，
+                        // 防止布局变化造成状态栏反复显示、隐藏。
+                        statusBarGestureHandled = true;
                     }
                     break;
 
                 case MotionEvent.ACTION_UP:
-                    float movedX = Math.abs(event.getX() - touchStartX);
-                    float movedY = Math.abs(event.getY() - touchStartY);
+                    float totalX = Math.abs(event.getRawX() - touchStartX);
+                    float totalY = Math.abs(event.getRawY() - touchStartY);
 
-                    // 轻点网页时恢复状态栏。
-                    // 使用 post，避免状态栏出现导致当前点击位置变化。
-                    if (movedX <= touchSlop && movedY <= touchSlop) {
+                    // 没有发生滑动，只是轻点页面时显示状态栏。
+                    if (!statusBarGestureHandled
+                            && totalX <= touchSlop
+                            && totalY <= touchSlop) {
                         view.post(this::showStatusBar);
                     }
 
-                    verticalAccumulator = 0f;
+                    statusBarGestureHandled = false;
                     break;
 
                 case MotionEvent.ACTION_CANCEL:
-                    verticalAccumulator = 0f;
+                    statusBarGestureHandled = false;
                     break;
 
                 default:
                     break;
             }
 
-            // 不拦截触摸，网页点击、滚动和文件上传继续执行。
+            // 不拦截网页自身的点击和滚动。
             return false;
         });
     }
