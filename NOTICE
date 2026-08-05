@@ -5,3 +5,10 @@ integrations from the uploaded ToApp APK.
 Third-party dependency:
 - apksig-android by Muntashir Al-Islam / Android apksig-derived code.
   Review its upstream license before redistribution.
+
+WebtoApp optional ad filtering
+------------------------------
+Generated apps can retrieve EasyList, EasyList China, AdGuard Mobile Ads and
+CJX Annoyance List from their original public URLs. Full source and licence
+references are embedded at shell/src/main/assets/adblock/THIRD_PARTY_FILTERS.md.
+No complete third-party filter list is bundled in the WebtoApp source archive.

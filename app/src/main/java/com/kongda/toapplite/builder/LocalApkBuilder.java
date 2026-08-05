@@ -261,6 +261,7 @@ final class LocalApkBuilder {
         JSONObject config = new JSONObject();
         config.put("url", spec.url);
         config.put("appName", spec.appName);
+        config.put("adBlockEnabled", spec.adBlockEnabled);
         return config.toString(2).getBytes(StandardCharsets.UTF_8);
     }
 

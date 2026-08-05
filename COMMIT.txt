@@ -1,1 +1,1 @@
-e336820e2b05b786a7840d0bc53ed50eada15155
+Add optional automatic ad filtering with EasyList, EasyList China, AdGuard Mobile Ads and CJX-compatible rules

@@ -19,6 +19,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -52,6 +53,7 @@ public final class MainActivity extends Activity {
     private EditText appNameInput;
     private EditText packageInput;
     private EditText urlInput;
+    private CheckBox adBlockInput;
     private ImageView iconPreview;
     private TextView statusText;
     private TextView fingerprintText;
@@ -99,6 +101,25 @@ public final class MainActivity extends Activity {
         packageInput = addField(content, "包名", "com.kongda.webapp");
         urlInput = addField(content, "HTTPS 网页地址", "https://example.com");
         urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+
+        adBlockInput = new CheckBox(this);
+        adBlockInput.setText("启用广告过滤（推荐）");
+        adBlockInput.setTextSize(15f);
+        adBlockInput.setTextColor(Color.BLACK);
+        adBlockInput.setChecked(true);
+        adBlockInput.setPadding(0, dp(12), 0, 0);
+        content.addView(adBlockInput, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        TextView adBlockHint = text(
+                "自动使用内置基础规则，并定期更新国际、中文和移动网页过滤规则。网站功能异常时可取消勾选后重新生成。",
+                13f,
+                0xff666666
+        );
+        adBlockHint.setPadding(dp(4), 0, 0, dp(4));
+        content.addView(adBlockHint);
 
         TextView iconLabel = text("应用图标（可选）", 14f, Color.DKGRAY);
         iconLabel.setPadding(0, dp(12), 0, dp(7));
@@ -177,7 +198,7 @@ public final class MainActivity extends Activity {
         content.addView(keyButtons);
 
         TextView limits = text(
-                "当前 WebtoApp 版：仅支持 HTTPS；生成的应用不含统计 SDK、远程更新、广告、JS 桥、相机、麦克风或定位权限。图片和普通文件上传均通过安卓系统选择器完成。",
+                "当前 WebtoApp 版：仅支持 HTTPS；生成的应用不含统计 SDK、远程控制、广告、JS 桥、相机、麦克风或定位权限。图片和普通文件上传均通过安卓系统选择器完成。启用广告过滤后，生成的应用会在后台更新公开过滤规则。",
                 13f,
                 0xff666666
         );
@@ -272,7 +293,13 @@ public final class MainActivity extends Activity {
         if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null) {
             throw new IllegalArgumentException("当前版本只接受完整的 HTTPS 地址");
         }
-        return new BuildSpec(appName, packageName, url, selectedIconFile);
+        return new BuildSpec(
+                appName,
+                packageName,
+                url,
+                selectedIconFile,
+                adBlockInput != null && adBlockInput.isChecked()
+        );
     }
 
     private void normalizeAndStoreIcon(Uri uri) {
@@ -391,7 +418,7 @@ public final class MainActivity extends Activity {
                     Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
                     intent.addCategory(Intent.CATEGORY_OPENABLE);
                     intent.setType("application/x-pkcs12");
-                    intent.putExtra(Intent.EXTRA_TITLE, "WebtoApp-signing-backup.p12");
+                    intent.putExtra(Intent.EXTRA_TITLE, "toapp-lite-signing-backup.p12");
                     startActivityForResult(intent, EXPORT_KEY_REQUEST);
                 })
                 .show();

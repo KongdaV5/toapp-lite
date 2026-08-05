@@ -2,7 +2,7 @@
 
 一个**完全在安卓手机本地运行**的网页转 APK 工具。它不修改原 ToApp 成品包，也不复用原作者的统计、官网、更新或推广代码。
 
-## v0.1 功能
+## v0.5 功能
 
 - 输入应用名称、包名和 HTTPS 网页地址；
 - 可选择自定义 PNG/JPG 图标；
@@ -10,7 +10,9 @@
 - 首次运行在应用私有目录生成 3072-bit RSA 签名身份；
 - 使用同一签名持续生成可覆盖更新的 APK；
 - 通过系统文件选择器保存 APK，不申请全盘存储权限；
-- 可把签名身份导出为带密码的 `.p12`，也可重新导入。
+- 可把签名身份导出为带密码的 `.p12`，也可重新导入；
+- 生成的网页应用支持系统返回、文件上传、图片/视频/文件下载；
+- 可选择启用广告过滤，默认使用内置基础规则，并定期更新公开过滤列表。
 
 ## 权限设计
 
@@ -37,7 +39,7 @@ WebView 默认：
 
 - 只接受 `https://` 入口；
 - 禁止明文 HTTP 和混合内容；
-- 禁止文件/内容 URI 访问；
+- 禁止本地文件路径访问；仅允许用户通过系统选择器明确选中的 `content://` 文件用于上传；
 - 禁止第三方 Cookie；
 - 不注入 JavaScript Bridge；
 - SSL 错误直接终止，不提供“继续访问”；
@@ -58,7 +60,7 @@ shell/     自有的极简 WebView 模板
 
 - JDK 17
 - Gradle 9.5.0
-- Android SDK Platform 37
+- Android SDK Platform 36
 - Android Build Tools 36.0.0
 
 命令：
@@ -70,7 +72,9 @@ gradle :app:assembleDebug
 安装包输出：
 
 ```text
-app/build/outputs/apk/debug/WebtoApp.apk
+app/build/outputs/apk/debug/app-debug.apk
+
+GitHub Actions 会把它复制并上传为 `WebtoApp.apk`.
 ```
 
 仓库自带 `.github/workflows/build.yml`。推送到 GitHub 后，也可在 Actions 的构建产物中下载 APK。
@@ -79,9 +83,10 @@ app/build/outputs/apk/debug/WebtoApp.apk
 
 1. 安装 `WebtoApp.apk`；
 2. 填写应用名称、唯一包名和 HTTPS 地址；
-3. 选择图标（可选）；
-4. 点击“生成并保存 APK”；
-5. 第一次生成后立即备份 P12，并妥善保存密码。
+3. 选择是否启用广告过滤（默认开启）；
+4. 选择图标（可选）；
+5. 点击“生成并保存 APK”；
+6. 第一次生成后立即备份 P12，并妥善保存密码。
 
 同一应用后续升级必须同时保持：
 
@@ -89,7 +94,7 @@ app/build/outputs/apk/debug/WebtoApp.apk
 - 签名密钥不变；
 - 新版本号高于旧版本。
 
-v0.1 模板版本固定为 `versionCode=1`，适合首次验证。下一版本应增加版本号输入和模板 Manifest 的整数值修改。
+生成模板当前仍固定为 `versionCode=1`。同一包名重新生成时，如需覆盖安装，后续仍应增加可配置版本号。
 
 ## 已知限制
 
@@ -97,6 +102,8 @@ v0.1 模板版本固定为 `versionCode=1`，适合首次验证。下一版本�
 - 不支持 HTTP；
 - 不支持相机、录音、定位、推送通知等原生能力；
 - 不支持直接安装生成结果，避免申请“安装未知应用”权限；
+- 广告过滤支持常见 ABP 网络规则和标准页面隐藏规则，不支持 scriptlet、DRM/流媒体广告或浏览器扩展级高级语法；
+- 广告规则由生成的网页应用在启动时按需更新；生成器本身仍不联网；
 - APK 模板的包名和应用名通过二进制 AXML 字符串池精确替换，模板结构改变时会拒绝生成，而不是盲目输出；
 - 当前项目未包含 Gradle Wrapper JAR，可用 Android Studio 自带 Gradle 或 GitHub Actions 构建。
 

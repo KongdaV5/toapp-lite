@@ -33,6 +33,7 @@ import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.URLUtil;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -114,6 +115,9 @@ public final class MainActivity extends Activity {
     private boolean touchMovedBeyondSlop;
 
     private Object backCallback;
+    private AdBlockEngine adBlockEngine;
+    private String configuredUrl;
+    private volatile String currentPageUrl;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -171,17 +175,31 @@ public final class MainActivity extends Activity {
 
         setContentView(root);
 
+        JSONObject appConfig = readAppConfig();
+        configuredUrl = appConfig == null
+                ? null
+                : appConfig.optString("url", null);
+
+        if (configuredUrl != null
+                && configuredUrl.startsWith("https://")
+                && appConfig.optBoolean("adBlockEnabled", true)) {
+            adBlockEngine = new AdBlockEngine(this);
+            adBlockEngine.start();
+        }
+
         configureSystemBars();
         configureWebView();
         configureAutoStatusBar();
         registerBackHandler();
 
-        String url = readConfiguredUrl();
-        if (url == null || !url.startsWith("https://")) {
+        if (configuredUrl == null
+                || !configuredUrl.startsWith("https://")) {
             showConfigurationError();
             return;
         }
-        webView.loadUrl(url);
+
+        currentPageUrl = configuredUrl;
+        webView.loadUrl(configuredUrl);
     }
 
     private void configureWindow() {
@@ -391,6 +409,15 @@ public final class MainActivity extends Activity {
                     WebView view,
                     WebResourceRequest request
             ) {
+                AdBlockEngine engine = adBlockEngine;
+                if (engine != null
+                        && engine.shouldBlockNavigation(
+                                request.getUrl(),
+                                currentPageUrl,
+                                request.hasGesture()
+                        )) {
+                    return true;
+                }
                 return handleNavigation(request.getUrl());
             }
 
@@ -401,6 +428,35 @@ public final class MainActivity extends Activity {
                     String url
             ) {
                 return handleNavigation(Uri.parse(url));
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(
+                    WebView view,
+                    WebResourceRequest request
+            ) {
+                AdBlockEngine engine = adBlockEngine;
+                return engine == null
+                        ? null
+                        : engine.shouldIntercept(
+                                request,
+                                currentPageUrl
+                        );
+            }
+
+            @SuppressWarnings("deprecation")
+            @Override
+            public WebResourceResponse shouldInterceptRequest(
+                    WebView view,
+                    String url
+            ) {
+                AdBlockEngine engine = adBlockEngine;
+                return engine == null
+                        ? null
+                        : engine.shouldIntercept(
+                                url,
+                                currentPageUrl
+                        );
             }
 
             @Override
@@ -418,7 +474,19 @@ public final class MainActivity extends Activity {
                     String url,
                     android.graphics.Bitmap favicon
             ) {
+                currentPageUrl = url;
                 progressBar.setVisibility(View.VISIBLE);
+            }
+
+            @Override
+            public void onPageCommitVisible(
+                    WebView view,
+                    String url
+            ) {
+                AdBlockEngine engine = adBlockEngine;
+                if (engine != null) {
+                    engine.injectCosmeticFilters(view, url);
+                }
             }
 
             @Override
@@ -426,8 +494,14 @@ public final class MainActivity extends Activity {
                     WebView view,
                     String url
             ) {
+                currentPageUrl = url;
                 progressBar.setProgress(100);
                 progressBar.setVisibility(View.GONE);
+
+                AdBlockEngine engine = adBlockEngine;
+                if (engine != null) {
+                    engine.injectCosmeticFilters(view, url);
+                }
             }
         });
 
@@ -1614,7 +1688,7 @@ public final class MainActivity extends Activity {
         return true;
     }
 
-    private String readConfiguredUrl() {
+    private JSONObject readAppConfig() {
         try (InputStream input = getAssets()
                 .open("app_config.json")) {
             ByteArrayOutputStream output =
@@ -1626,12 +1700,11 @@ public final class MainActivity extends Activity {
                 output.write(buffer, 0, read);
             }
 
-            JSONObject json = new JSONObject(
+            return new JSONObject(
                     output.toString(
                             StandardCharsets.UTF_8.name()
                     )
             );
-            return json.optString("url", null);
         } catch (Exception error) {
             return null;
         }
@@ -1812,6 +1885,12 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         unregisterBackHandler();
+
+        if (adBlockEngine != null) {
+            adBlockEngine.close();
+            adBlockEngine = null;
+        }
+
         mainHandler.removeCallbacksAndMessages(null);
         legacyDownloadExecutor.shutdownNow();
         pendingLegacyDownload = null;

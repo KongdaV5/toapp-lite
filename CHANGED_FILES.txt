@@ -1,0 +1,18 @@
+覆盖包文件清单：
+
+app/build.gradle.kts
+app/src/main/java/com/kongda/toapplite/builder/BuildSpec.java
+app/src/main/java/com/kongda/toapplite/builder/LocalApkBuilder.java
+app/src/main/java/com/kongda/toapplite/builder/MainActivity.java
+shell/src/main/assets/app_config.json
+shell/src/main/assets/adblock/bootstrap.txt
+shell/src/main/assets/adblock/THIRD_PARTY_FILTERS.md
+shell/src/main/java/com/kongda/toapplite/shell/AdBlockEngine.java
+shell/src/main/java/com/kongda/toapplite/shell/MainActivity.java
+README.md
+NOTICE
+COMMIT.txt
+docs/V0.5_ADBLOCK.md
+
+使用方法：把本压缩包内容放到仓库根目录，按相同路径覆盖，然后一次提交。
+提交说明：Add automatic ad filtering with managed public rules

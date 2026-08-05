@@ -1,4 +1,5 @@
 {
   "url": "https://example.com",
-  "appName": "ToApp Lite Generated App"
+  "appName": "WebtoApp Generated App",
+  "adBlockEnabled": true
 }
