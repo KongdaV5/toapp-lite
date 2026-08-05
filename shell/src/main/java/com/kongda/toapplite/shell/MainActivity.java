@@ -1,9 +1,5 @@
 package com.kongda.toapplite.shell;
 
-import android.view.MotionEvent;
-import android.view.ViewConfiguration;
-import android.view.WindowInsetsController;
-
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
@@ -13,9 +9,14 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.WindowInsetsAnimation;
+import android.view.WindowInsetsController;
 import android.webkit.CookieManager;
 import android.webkit.MimeTypeMap;
 import android.webkit.SslErrorHandler;
@@ -36,6 +37,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
@@ -53,15 +55,24 @@ import java.util.Set;
  */
 public final class MainActivity extends Activity {
     private static final int FILE_CHOOSER_REQUEST = 901;
+    private static final long STATUS_BAR_TOGGLE_COOLDOWN_MS = 220L;
+    private static final int STATUS_ACTION_NONE = 0;
+    private static final int STATUS_ACTION_HIDE = -1;
+    private static final int STATUS_ACTION_SHOW = 1;
 
+    private FrameLayout root;
+    private FrameLayout contentContainer;
     private WebView webView;
     private ProgressBar progressBar;
     private ValueCallback<Uri[]> pendingFileCallback;
+
     private int touchSlop;
     private float touchStartX;
     private float touchStartY;
     private boolean statusBarGestureHandled;
+    private int pendingStatusAction = STATUS_ACTION_NONE;
     private boolean statusBarHidden;
+    private long lastStatusBarToggleAt;
 
     private android.window.OnBackInvokedCallback backCallback;
 
@@ -70,15 +81,19 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         WebView.setWebContentsDebuggingEnabled(false);
 
-        FrameLayout root = new FrameLayout(this);
+        root = new FrameLayout(this);
         root.setBackgroundColor(Color.WHITE);
-        configureSystemBars(root);
 
+        contentContainer = new FrameLayout(this);
         webView = new WebView(this);
-        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar = new ProgressBar(
+                this,
+                null,
+                android.R.attr.progressBarStyleHorizontal
+        );
         progressBar.setMax(100);
 
-        root.addView(webView, new FrameLayout.LayoutParams(
+        contentContainer.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
         ));
@@ -88,9 +103,15 @@ public final class MainActivity extends Activity {
                 dp(3)
         );
         progressParams.gravity = android.view.Gravity.TOP;
-        root.addView(progressBar, progressParams);
+        contentContainer.addView(progressBar, progressParams);
+
+        root.addView(contentContainer, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+        ));
         setContentView(root);
 
+        configureSystemBars();
         configureWebView();
         configureAutoStatusBar();
         registerBackHandler();
@@ -103,7 +124,12 @@ public final class MainActivity extends Activity {
         webView.loadUrl(url);
     }
 
-    private void configureSystemBars(FrameLayout root) {
+    /**
+     * Applies final safe-area padding only once per inset state, then uses a compositor
+     * translation during the system status-bar animation. This avoids repeatedly resizing
+     * and relaying out the WebView on every animation frame.
+     */
+    private void configureSystemBars() {
         getWindow().setStatusBarColor(Color.WHITE);
         getWindow().setNavigationBarColor(Color.WHITE);
 
@@ -116,11 +142,17 @@ public final class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             visibility |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
         }
-
         decorView.setSystemUiVisibility(visibility);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             getWindow().setDecorFitsSystemWindows(false);
+
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_DEFAULT
+                );
+            }
 
             root.setOnApplyWindowInsetsListener((view, insets) -> {
                 android.graphics.Insets status = insets.getInsets(
@@ -149,30 +181,135 @@ public final class MainActivity extends Activity {
                         Math.max(status.right, navigation.right),
                         cutout.right
                 );
-
                 int topPadding = statusVisible
                         ? Math.max(status.top, cutout.top)
                         : 0;
-
                 int bottomPadding = Math.max(
                         navigation.bottom,
                         ime.bottom
                 );
 
-                view.setPadding(
-                        leftPadding,
-                        topPadding,
-                        rightPadding,
-                        bottomPadding
-                );
+                if (view.getPaddingLeft() != leftPadding
+                        || view.getPaddingTop() != topPadding
+                        || view.getPaddingRight() != rightPadding
+                        || view.getPaddingBottom() != bottomPadding) {
+                    view.setPadding(
+                            leftPadding,
+                            topPadding,
+                            rightPadding,
+                            bottomPadding
+                    );
+                }
 
-                return insets;
+                /*
+                 * The native root has already consumed these dimensions as padding.
+                 * Zero them before dispatching to WebView so WebView does not apply the
+                 * same system-bar/IME adjustment a second time.
+                 */
+                return new WindowInsets.Builder(insets)
+                        .setInsets(
+                                WindowInsets.Type.statusBars()
+                                        | WindowInsets.Type.navigationBars()
+                                        | WindowInsets.Type.displayCutout()
+                                        | WindowInsets.Type.ime(),
+                                android.graphics.Insets.NONE
+                        )
+                        .build();
             });
+
+            root.setWindowInsetsAnimationCallback(
+                    new WindowInsetsAnimation.Callback(
+                            WindowInsetsAnimation.Callback
+                                    .DISPATCH_MODE_CONTINUE_ON_SUBTREE
+                    ) {
+                        private int startContentY;
+                        private int translationDeltaY;
+                        private boolean statusAnimationRunning;
+
+                        @Override
+                        public void onPrepare(WindowInsetsAnimation animation) {
+                            if (!isStatusBarAnimation(animation)) {
+                                return;
+                            }
+
+                            contentContainer.animate().cancel();
+                            contentContainer.setTranslationY(0f);
+
+                            int[] location = new int[2];
+                            contentContainer.getLocationOnScreen(location);
+                            startContentY = location[1];
+                            translationDeltaY = 0;
+                            statusAnimationRunning = true;
+                        }
+
+                        @Override
+                        public WindowInsetsAnimation.Bounds onStart(
+                                WindowInsetsAnimation animation,
+                                WindowInsetsAnimation.Bounds bounds
+                        ) {
+                            if (!isStatusBarAnimation(animation)) {
+                                return bounds;
+                            }
+
+                            int[] location = new int[2];
+                            contentContainer.getLocationOnScreen(location);
+                            translationDeltaY = startContentY - location[1];
+
+                            /*
+                             * The layout has already jumped to its final inset state.
+                             * Apply the inverse translation immediately so the user sees
+                             * no jump, then let onProgress remove it smoothly.
+                             */
+                            contentContainer.setTranslationY(translationDeltaY);
+                            return bounds;
+                        }
+
+                        @Override
+                        public WindowInsets onProgress(
+                                WindowInsets insets,
+                                List<WindowInsetsAnimation> runningAnimations
+                        ) {
+                            if (!statusAnimationRunning) {
+                                return insets;
+                            }
+
+                            for (WindowInsetsAnimation animation : runningAnimations) {
+                                if (!isStatusBarAnimation(animation)) {
+                                    continue;
+                                }
+
+                                float fraction = animation.getInterpolatedFraction();
+                                contentContainer.setTranslationY(
+                                        translationDeltaY * (1f - fraction)
+                                );
+                                break;
+                            }
+                            return insets;
+                        }
+
+                        @Override
+                        public void onEnd(WindowInsetsAnimation animation) {
+                            if (!isStatusBarAnimation(animation)) {
+                                return;
+                            }
+
+                            contentContainer.setTranslationY(0f);
+                            translationDeltaY = 0;
+                            statusAnimationRunning = false;
+                        }
+                    }
+            );
 
             root.post(root::requestApplyInsets);
         } else {
             root.setFitsSystemWindows(true);
         }
+    }
+
+    private static boolean isStatusBarAnimation(
+            WindowInsetsAnimation animation
+    ) {
+        return (animation.getTypeMask() & WindowInsets.Type.statusBars()) != 0;
     }
 
     private void configureWebView() {
@@ -195,7 +332,7 @@ public final class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
 
         // Some sites hide upload controls when they detect the generic Android WebView UA.
-        // Keep the real Chrome/WebView version while removing only the embedded-view markers.
+        // Keep the real Chrome/WebView version while removing only embedded-view markers.
         String userAgent = settings.getUserAgentString();
         if (userAgent != null) {
             settings.setUserAgentString(
@@ -209,7 +346,10 @@ public final class MainActivity extends Activity {
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            public boolean shouldOverrideUrlLoading(
+                    WebView view,
+                    WebResourceRequest request
+            ) {
                 return handleNavigation(request.getUrl());
             }
 
@@ -220,12 +360,20 @@ public final class MainActivity extends Activity {
             }
 
             @Override
-            public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            public void onReceivedSslError(
+                    WebView view,
+                    SslErrorHandler handler,
+                    SslError error
+            ) {
                 handler.cancel();
             }
 
             @Override
-            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+            public void onPageStarted(
+                    WebView view,
+                    String url,
+                    android.graphics.Bitmap favicon
+            ) {
                 progressBar.setVisibility(View.VISIBLE);
             }
 
@@ -240,7 +388,9 @@ public final class MainActivity extends Activity {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 progressBar.setProgress(newProgress);
-                progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
+                progressBar.setVisibility(
+                        newProgress >= 100 ? View.GONE : View.VISIBLE
+                );
             }
 
             @Override
@@ -257,15 +407,150 @@ public final class MainActivity extends Activity {
             }
         });
 
-        webView.setDownloadListener((url, downloadUserAgent, contentDisposition, mimeType, contentLength) -> {
+        webView.setDownloadListener((
+                url,
+                downloadUserAgent,
+                contentDisposition,
+                mimeType,
+                contentLength
+        ) -> {
             try {
                 Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                 startActivity(intent);
             } catch (ActivityNotFoundException ignored) {
-                // No compatible external application. Do not silently download inside the shell.
+                // No compatible external application.
             }
         });
     }
+
+    private void configureAutoStatusBar() {
+        touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        final int gestureThreshold = dp(28);
+
+        webView.setOnTouchListener((view, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    touchStartX = event.getRawX();
+                    touchStartY = event.getRawY();
+                    statusBarGestureHandled = false;
+                    pendingStatusAction = STATUS_ACTION_NONE;
+                    break;
+
+                case MotionEvent.ACTION_MOVE:
+                    if (statusBarGestureHandled) {
+                        break;
+                    }
+
+                    float movedX = event.getRawX() - touchStartX;
+                    float movedY = event.getRawY() - touchStartY;
+
+                    if (Math.abs(movedY) > Math.abs(movedX)
+                            && Math.abs(movedY) >= gestureThreshold) {
+                        pendingStatusAction = movedY < 0f
+                                ? STATUS_ACTION_HIDE
+                                : STATUS_ACTION_SHOW;
+                        statusBarGestureHandled = true;
+                    }
+                    break;
+
+                case MotionEvent.ACTION_UP:
+                    float totalX = Math.abs(event.getRawX() - touchStartX);
+                    float totalY = Math.abs(event.getRawY() - touchStartY);
+
+                    if (statusBarGestureHandled) {
+                        int action = pendingStatusAction;
+
+                        /*
+                         * Do not resize the WebView while the finger is still driving
+                         * an active scroll. Start the bar transition on the next frame
+                         * after ACTION_UP.
+                         */
+                        view.postOnAnimation(() -> applyStatusAction(action));
+                    } else if (totalX <= touchSlop && totalY <= touchSlop) {
+                        view.postOnAnimation(this::showStatusBar);
+                    }
+
+                    statusBarGestureHandled = false;
+                    pendingStatusAction = STATUS_ACTION_NONE;
+                    break;
+
+                case MotionEvent.ACTION_CANCEL:
+                    statusBarGestureHandled = false;
+                    pendingStatusAction = STATUS_ACTION_NONE;
+                    break;
+
+                default:
+                    break;
+            }
+
+            // Keep WebView clicks, scrolling, selection and uploads untouched.
+            return false;
+        });
+    }
+
+    private void applyStatusAction(int action) {
+        if (action == STATUS_ACTION_HIDE) {
+            hideStatusBar();
+        } else if (action == STATUS_ACTION_SHOW) {
+            showStatusBar();
+        }
+    }
+
+    private boolean canToggleStatusBar() {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastStatusBarToggleAt < STATUS_BAR_TOGGLE_COOLDOWN_MS) {
+            return false;
+        }
+        lastStatusBarToggleAt = now;
+        return true;
+    }
+
+    private void hideStatusBar() {
+        if (statusBarHidden || !canToggleStatusBar()) {
+            return;
+        }
+
+        statusBarHidden = true;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars());
+            }
+        } else {
+            View decorView = getWindow().getDecorView();
+            decorView.setSystemUiVisibility(
+                    decorView.getSystemUiVisibility()
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            );
+        }
+    }
+
+    private void showStatusBar() {
+        if (!statusBarHidden || !canToggleStatusBar()) {
+            return;
+        }
+
+        statusBarHidden = false;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.show(WindowInsets.Type.statusBars());
+            }
+        } else {
+            View decorView = getWindow().getDecorView();
+            int visibility = decorView.getSystemUiVisibility();
+
+            visibility &= ~View.SYSTEM_UI_FLAG_FULLSCREEN;
+            visibility &= ~View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
+
+            decorView.setSystemUiVisibility(visibility);
+        }
+    }
+
     private void registerBackHandler() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             backCallback = this::handleBackNavigation;
@@ -284,130 +569,10 @@ public final class MainActivity extends Activity {
             finish();
         }
     }
-    private void configureAutoStatusBar() {
-        touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
-        final int gestureThreshold = dp(24);
 
-        webView.setOnTouchListener((view, event) -> {
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    // 使用屏幕绝对坐标，不受状态栏出现、页面重新布局影响。
-                    touchStartX = event.getRawX();
-                    touchStartY = event.getRawY();
-                    statusBarGestureHandled = false;
-                    break;
-
-                case MotionEvent.ACTION_MOVE:
-                    if (statusBarGestureHandled) {
-                        break;
-                    }
-
-                    float movedX = event.getRawX() - touchStartX;
-                    float movedY = event.getRawY() - touchStartY;
-
-                    // 只处理明显的纵向手势。
-                    if (Math.abs(movedY) > Math.abs(movedX)
-                            && Math.abs(movedY) >= gestureThreshold) {
-
-                        if (movedY < 0f) {
-                            // 手指上滑：隐藏状态栏。
-                            hideStatusBar();
-                        } else {
-                            // 手指下滑：显示状态栏。
-                            showStatusBar();
-                        }
-
-                        // 同一次手指按下过程中只允许切换一次，
-                        // 防止布局变化造成状态栏反复显示、隐藏。
-                        statusBarGestureHandled = true;
-                    }
-                    break;
-
-                case MotionEvent.ACTION_UP:
-                    float totalX = Math.abs(event.getRawX() - touchStartX);
-                    float totalY = Math.abs(event.getRawY() - touchStartY);
-
-                    // 没有发生滑动，只是轻点页面时显示状态栏。
-                    if (!statusBarGestureHandled
-                            && totalX <= touchSlop
-                            && totalY <= touchSlop) {
-                        view.post(this::showStatusBar);
-                    }
-
-                    statusBarGestureHandled = false;
-                    break;
-
-                case MotionEvent.ACTION_CANCEL:
-                    statusBarGestureHandled = false;
-                    break;
-
-                default:
-                    break;
-            }
-
-            // 不拦截网页自身的点击和滚动。
-            return false;
-        });
-    }
-
-    private void hideStatusBar() {
-        if (statusBarHidden) {
-            return;
-        }
-
-        statusBarHidden = true;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            WindowInsetsController controller =
-                    getWindow().getInsetsController();
-
-            if (controller != null) {
-                controller.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_DEFAULT
-                );
-                controller.hide(WindowInsets.Type.statusBars());
-            }
-
-            getWindow().getDecorView().requestApplyInsets();
-        } else {
-            View decorView = getWindow().getDecorView();
-
-            decorView.setSystemUiVisibility(
-                    decorView.getSystemUiVisibility()
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            );
-        }
-    }
-
-    private void showStatusBar() {
-        if (!statusBarHidden) {
-            return;
-        }
-
-        statusBarHidden = false;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            WindowInsetsController controller =
-                    getWindow().getInsetsController();
-
-            if (controller != null) {
-                controller.show(WindowInsets.Type.statusBars());
-            }
-
-            getWindow().getDecorView().requestApplyInsets();
-        } else {
-            View decorView = getWindow().getDecorView();
-            int visibility = decorView.getSystemUiVisibility();
-
-            visibility &= ~View.SYSTEM_UI_FLAG_FULLSCREEN;
-            visibility &= ~View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
-
-            decorView.setSystemUiVisibility(visibility);
-        }
-    }
-    private boolean launchSystemFilePicker(WebChromeClient.FileChooserParams params) {
+    private boolean launchSystemFilePicker(
+            WebChromeClient.FileChooserParams params
+    ) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -423,7 +588,8 @@ public final class MainActivity extends Activity {
         }
         intent.putExtra(
                 Intent.EXTRA_ALLOW_MULTIPLE,
-                params.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+                params.getMode()
+                        == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
         );
 
         try {
@@ -432,13 +598,16 @@ public final class MainActivity extends Activity {
         } catch (ActivityNotFoundException firstError) {
             Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
             fallback.addCategory(Intent.CATEGORY_OPENABLE);
-            fallback.setType(mimeTypes.length == 1 ? mimeTypes[0] : "*/*");
+            fallback.setType(
+                    mimeTypes.length == 1 ? mimeTypes[0] : "*/*"
+            );
             if (mimeTypes.length > 1) {
                 fallback.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes);
             }
             fallback.putExtra(
                     Intent.EXTRA_ALLOW_MULTIPLE,
-                    params.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+                    params.getMode()
+                            == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
             );
             try {
                 startActivityForResult(fallback, FILE_CHOOSER_REQUEST);
@@ -505,9 +674,11 @@ public final class MainActivity extends Activity {
             while ((read = input.read(buffer)) != -1) {
                 output.write(buffer, 0, read);
             }
-            JSONObject json = new JSONObject(output.toString(StandardCharsets.UTF_8.name()));
+            JSONObject json = new JSONObject(
+                    output.toString(StandardCharsets.UTF_8.name())
+            );
             return json.optString("url", null);
-        } catch (Exception e) {
+        } catch (Exception error) {
             return null;
         }
     }
@@ -515,21 +686,28 @@ public final class MainActivity extends Activity {
     private void showConfigurationError() {
         webView.setVisibility(View.GONE);
         progressBar.setVisibility(View.GONE);
+
         TextView error = new TextView(this);
         error.setText("应用配置无效：仅支持 HTTPS 地址。");
         error.setTextColor(Color.DKGRAY);
         error.setTextSize(17f);
         error.setGravity(android.view.Gravity.CENTER);
-        ((ViewGroup) webView.getParent()).addView(error, new FrameLayout.LayoutParams(
+
+        contentContainer.addView(error, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
         ));
     }
 
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    protected void onActivityResult(
+            int requestCode,
+            int resultCode,
+            Intent data
+    ) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != FILE_CHOOSER_REQUEST || pendingFileCallback == null) {
+        if (requestCode != FILE_CHOOSER_REQUEST
+                || pendingFileCallback == null) {
             return;
         }
 
@@ -569,10 +747,17 @@ public final class MainActivity extends Activity {
             );
             backCallback = null;
         }
+
+        if (root != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            root.setWindowInsetsAnimationCallback(null);
+            root.setOnApplyWindowInsetsListener(null);
+        }
+
         if (pendingFileCallback != null) {
             pendingFileCallback.onReceiveValue(null);
             pendingFileCallback = null;
         }
+
         if (webView != null) {
             ViewGroup parent = (ViewGroup) webView.getParent();
             if (parent != null) {
@@ -584,10 +769,13 @@ public final class MainActivity extends Activity {
             webView.destroy();
             webView = null;
         }
+
         super.onDestroy();
     }
 
     private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+        return Math.round(
+                value * getResources().getDisplayMetrics().density
+        );
     }
 }
