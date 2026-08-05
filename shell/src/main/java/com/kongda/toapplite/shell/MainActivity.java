@@ -1,6 +1,8 @@
 package com.kongda.toapplite.shell;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
@@ -10,6 +12,9 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.view.DisplayCutout;
 import android.view.MotionEvent;
@@ -28,23 +33,32 @@ import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.URLUtil;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Minimal generated web shell.
@@ -60,6 +74,8 @@ import java.util.Set;
  */
 public final class MainActivity extends Activity {
     private static final int FILE_CHOOSER_REQUEST = 901;
+    private static final int SAVE_DOWNLOAD_REQUEST = 902;
+    private static final int MAX_DOWNLOAD_REDIRECTS = 5;
     private static final long LEGACY_BAR_ANIMATION_MS = 180L;
 
     private FrameLayout root;
@@ -68,6 +84,14 @@ public final class MainActivity extends Activity {
     private WebView webView;
     private ProgressBar progressBar;
     private ValueCallback<Uri[]> pendingFileCallback;
+    private final ExecutorService legacyDownloadExecutor =
+            Executors.newSingleThreadExecutor();
+    private final Handler mainHandler =
+            new Handler(Looper.getMainLooper());
+    private PendingDownload pendingLegacyDownload;
+    private float lastTouchViewX;
+    private float lastTouchViewY;
+    private boolean forwardingDefaultLongClick;
 
     private int statusBarOverlayHeight;
     private boolean requestedStatusBarHidden;
@@ -441,17 +465,783 @@ public final class MainActivity extends Activity {
                 contentDisposition,
                 mimeType,
                 contentLength
-        ) -> {
+        ) -> startDownload(
+                url,
+                downloadUserAgent,
+                contentDisposition,
+                mimeType
+        ));
+
+        webView.setOnLongClickListener(
+                this::handleWebViewLongClick
+        );
+    }
+
+    private boolean handleWebViewLongClick(View ignored) {
+        if (forwardingDefaultLongClick
+                || webView == null) {
+            return false;
+        }
+
+        WebView.HitTestResult hit =
+                webView.getHitTestResult();
+
+        if (hit.getType()
+                == WebView.HitTestResult.IMAGE_TYPE
+                && isHttpsUrl(hit.getExtra())) {
+            showDownloadDialog(
+                    "image",
+                    hit.getExtra(),
+                    null
+            );
+            return true;
+        }
+
+        inspectLongPressedElement();
+        return true;
+    }
+
+    private void inspectLongPressedElement() {
+        if (webView == null) {
+            return;
+        }
+
+        String script = String.format(
+                Locale.US,
+                "(function(x,y){"
+                        + "try{"
+                        + "var r=window.devicePixelRatio||1;"
+                        + "var e=document.elementFromPoint(x/r,y/r);"
+                        + "while(e&&e!==document.documentElement){"
+                        + "var t=(e.tagName||'').toLowerCase();"
+                        + "if(t==='img'){"
+                        + "return ['image',e.currentSrc||e.src||'',''];"
+                        + "}"
+                        + "if(t==='video'){"
+                        + "var s=e.currentSrc||e.src||'';"
+                        + "var m=e.getAttribute('type')||'';"
+                        + "if(!s){"
+                        + "var q=e.querySelector('source[src]');"
+                        + "if(q){s=q.src||'';m=q.type||m;}"
+                        + "}"
+                        + "return ['video',s,m];"
+                        + "}"
+                        + "if(t==='source'&&e.parentElement"
+                        + "&&(e.parentElement.tagName||'')"
+                        + ".toLowerCase()==='video'){"
+                        + "return ['video',e.src||'',e.type||''];"
+                        + "}"
+                        + "if(t==='a'&&e.href){"
+                        + "var h=e.href||'';"
+                        + "var p=h.split('#')[0].split('?')[0]"
+                        + ".toLowerCase();"
+                        + "var d=e.hasAttribute('download');"
+                        + "var media=/\\.(png|jpe?g|gif|webp|bmp|svg|avif"
+                        + "|mp4|webm|mov|m4v|mkv|avi|m3u8)$/i.test(p);"
+                        + "if(d||media){return ['link',h,''];}"
+                        + "}"
+                        + "e=e.parentElement;"
+                        + "}"
+                        + "return null;"
+                        + "}catch(error){return null;}"
+                        + "})(%.2f,%.2f);",
+                lastTouchViewX,
+                lastTouchViewY
+        );
+
+        webView.evaluateJavascript(script, value -> {
+            if (value == null
+                    || "null".equals(value)) {
+                performDefaultWebViewLongClick();
+                return;
+            }
+
             try {
-                Intent intent = new Intent(
-                        Intent.ACTION_VIEW,
-                        Uri.parse(url)
+                JSONArray result = new JSONArray(value);
+                String kind = result.optString(0, "");
+                String url = result.optString(1, "");
+                String mimeType = result.optString(2, "");
+
+                if (url.isEmpty()) {
+                    performDefaultWebViewLongClick();
+                    return;
+                }
+
+                showDownloadDialog(
+                        kind,
+                        url,
+                        mimeType
                 );
-                startActivity(intent);
-            } catch (ActivityNotFoundException ignored) {
-                // No compatible external application.
+            } catch (Exception error) {
+                performDefaultWebViewLongClick();
             }
         });
+    }
+
+    private void performDefaultWebViewLongClick() {
+        if (webView == null
+                || forwardingDefaultLongClick) {
+            return;
+        }
+
+        forwardingDefaultLongClick = true;
+        webView.setOnLongClickListener(null);
+        webView.performLongClick(
+                lastTouchViewX,
+                lastTouchViewY
+        );
+
+        webView.post(() -> {
+            if (webView != null) {
+                webView.setOnLongClickListener(
+                        this::handleWebViewLongClick
+                );
+            }
+            forwardingDefaultLongClick = false;
+        });
+    }
+
+    private void showDownloadDialog(
+            String kind,
+            String url,
+            String mimeType
+    ) {
+        String normalizedKind = classifyKind(
+                kind,
+                mimeType,
+                url
+        );
+
+        String title;
+        if ("image".equals(normalizedKind)) {
+            title = "图片";
+        } else if ("video".equals(normalizedKind)) {
+            title = "视频";
+        } else {
+            title = "文件";
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setItems(
+                        new String[]{
+                                "保存到手机",
+                                "用外部应用打开"
+                        },
+                        (dialog, which) -> {
+                            if (which == 0) {
+                                startDownload(
+                                        url,
+                                        webView == null
+                                                ? null
+                                                : webView.getSettings()
+                                                .getUserAgentString(),
+                                        null,
+                                        mimeType,
+                                        normalizedKind
+                                );
+                            } else {
+                                openInExternalApp(url);
+                            }
+                        }
+                )
+                .show();
+    }
+
+    private void openInExternalApp(String url) {
+        try {
+            Intent intent = new Intent(
+                    Intent.ACTION_VIEW,
+                    Uri.parse(url)
+            );
+            startActivity(intent);
+        } catch (Exception error) {
+            toast("没有可打开该资源的应用");
+        }
+    }
+
+    private void startDownload(
+            String url,
+            String userAgent,
+            String contentDisposition,
+            String mimeType
+    ) {
+        startDownload(
+                url,
+                userAgent,
+                contentDisposition,
+                mimeType,
+                ""
+        );
+    }
+
+    private void startDownload(
+            String url,
+            String userAgent,
+            String contentDisposition,
+            String mimeType,
+            String suggestedKind
+    ) {
+        PendingDownload download = createPendingDownload(
+                url,
+                userAgent,
+                contentDisposition,
+                mimeType,
+                suggestedKind
+        );
+
+        if (download == null) {
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT
+                >= Build.VERSION_CODES.Q) {
+            enqueueSystemDownload(download);
+        } else {
+            chooseLegacyDownloadDestination(download);
+        }
+    }
+
+    private PendingDownload createPendingDownload(
+            String url,
+            String userAgent,
+            String contentDisposition,
+            String mimeType,
+            String suggestedKind
+    ) {
+        if (!isHttpsUrl(url)) {
+            if (url != null
+                    && url.toLowerCase(Locale.US)
+                    .startsWith("blob:")) {
+                toast("该资源是 Blob 临时地址，当前不能直接下载");
+            } else {
+                toast("只支持 HTTPS 直链下载");
+            }
+            return null;
+        }
+
+        String normalizedMime =
+                normalizeDownloadMimeType(mimeType, url);
+        String normalizedKind = classifyKind(
+                suggestedKind,
+                normalizedMime,
+                url
+        );
+
+        if (isStreamingPlaylist(url, normalizedMime)) {
+            toast("暂不支持 M3U8、分片流或 DRM 视频");
+            return null;
+        }
+
+        String fileName = URLUtil.guessFileName(
+                url,
+                contentDisposition,
+                normalizedMime
+        );
+        fileName = sanitizeDownloadFileName(
+                fileName,
+                normalizedMime
+        );
+
+        String referer =
+                webView == null ? null : webView.getUrl();
+        String cookie = CookieManager.getInstance()
+                .getCookie(url);
+
+        return new PendingDownload(
+                url,
+                fileName,
+                normalizedMime,
+                normalizedKind,
+                userAgent,
+                cookie,
+                referer
+        );
+    }
+
+    private void enqueueSystemDownload(
+            PendingDownload download
+    ) {
+        try {
+            DownloadManager.Request request =
+                    new DownloadManager.Request(
+                            Uri.parse(download.url)
+                    );
+
+            request.setTitle(download.fileName);
+            request.setDescription("WebtoApp 下载");
+            request.setNotificationVisibility(
+                    DownloadManager.Request
+                            .VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+            );
+            request.setAllowedOverMetered(true);
+            request.setAllowedOverRoaming(true);
+
+            if (download.mimeType != null) {
+                request.setMimeType(download.mimeType);
+            }
+            addDownloadHeaders(request, download);
+
+            String directory = directoryForDownload(
+                    download.kind,
+                    download.mimeType,
+                    download.url
+            );
+
+            request.setDestinationInExternalPublicDir(
+                    directory,
+                    "WebtoApp/" + download.fileName
+            );
+
+            DownloadManager manager =
+                    (DownloadManager) getSystemService(
+                            DOWNLOAD_SERVICE
+                    );
+
+            if (manager == null) {
+                toast("系统下载服务不可用");
+                return;
+            }
+
+            manager.enqueue(request);
+            toast("已加入系统下载任务");
+        } catch (Exception error) {
+            toast("无法开始下载：" + readableMessage(error));
+        }
+    }
+
+    private static void addDownloadHeaders(
+            DownloadManager.Request request,
+            PendingDownload download
+    ) {
+        if (download.userAgent != null
+                && !download.userAgent.isEmpty()) {
+            request.addRequestHeader(
+                    "User-Agent",
+                    download.userAgent
+            );
+        }
+        if (download.cookie != null
+                && !download.cookie.isEmpty()) {
+            request.addRequestHeader(
+                    "Cookie",
+                    download.cookie
+            );
+        }
+        if (download.referer != null
+                && isHttpsUrl(download.referer)) {
+            request.addRequestHeader(
+                    "Referer",
+                    download.referer
+            );
+        }
+    }
+
+    private void chooseLegacyDownloadDestination(
+            PendingDownload download
+    ) {
+        if (pendingLegacyDownload != null) {
+            toast("请先完成当前文件的保存");
+            return;
+        }
+
+        pendingLegacyDownload = download;
+
+        Intent intent = new Intent(
+                Intent.ACTION_CREATE_DOCUMENT
+        );
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType(
+                download.mimeType == null
+                        ? "application/octet-stream"
+                        : download.mimeType
+        );
+        intent.putExtra(
+                Intent.EXTRA_TITLE,
+                download.fileName
+        );
+
+        try {
+            startActivityForResult(
+                    intent,
+                    SAVE_DOWNLOAD_REQUEST
+            );
+        } catch (ActivityNotFoundException error) {
+            pendingLegacyDownload = null;
+            toast("系统没有可用的文件保存器");
+        }
+    }
+
+    private void downloadToDocument(
+            Uri destination,
+            PendingDownload download
+    ) {
+        toast("开始下载，请保持网络连接");
+
+        legacyDownloadExecutor.execute(() -> {
+            HttpURLConnection connection = null;
+
+            try {
+                connection = openDownloadConnection(download);
+
+                try (InputStream input =
+                             new BufferedInputStream(
+                                     connection.getInputStream()
+                             );
+                     OutputStream output =
+                             getContentResolver()
+                                     .openOutputStream(
+                                             destination,
+                                             "w"
+                                     )) {
+                    if (output == null) {
+                        throw new IllegalStateException(
+                                "无法打开保存位置"
+                        );
+                    }
+
+                    byte[] buffer = new byte[64 * 1024];
+                    int read;
+
+                    while ((read = input.read(buffer)) != -1) {
+                        output.write(buffer, 0, read);
+                    }
+
+                    output.flush();
+                }
+
+                mainHandler.post(
+                        () -> toast("下载完成")
+                );
+            } catch (Exception error) {
+                try {
+                    getContentResolver().delete(
+                            destination,
+                            null,
+                            null
+                    );
+                } catch (Exception ignored) {
+                    // Some document providers do not support delete.
+                }
+
+                mainHandler.post(
+                        () -> toast(
+                                "下载失败："
+                                        + readableMessage(error)
+                        )
+                );
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        });
+    }
+
+    private HttpURLConnection openDownloadConnection(
+            PendingDownload download
+    ) throws Exception {
+        URL originalUrl = new URL(download.url);
+        URL currentUrl = originalUrl;
+
+        for (int redirect = 0;
+                redirect <= MAX_DOWNLOAD_REDIRECTS;
+                redirect++) {
+            HttpURLConnection connection =
+                    (HttpURLConnection)
+                            currentUrl.openConnection();
+
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(20_000);
+            connection.setReadTimeout(60_000);
+            connection.setRequestMethod("GET");
+            connection.setRequestProperty(
+                    "Accept",
+                    "*/*"
+            );
+
+            if (download.userAgent != null
+                    && !download.userAgent.isEmpty()) {
+                connection.setRequestProperty(
+                        "User-Agent",
+                        download.userAgent
+                );
+            }
+
+            if (download.cookie != null
+                    && !download.cookie.isEmpty()
+                    && sameHost(originalUrl, currentUrl)) {
+                connection.setRequestProperty(
+                        "Cookie",
+                        download.cookie
+                );
+            }
+
+            if (download.referer != null
+                    && isHttpsUrl(download.referer)) {
+                connection.setRequestProperty(
+                        "Referer",
+                        download.referer
+                );
+            }
+
+            int responseCode =
+                    connection.getResponseCode();
+
+            if (responseCode >= 300
+                    && responseCode < 400) {
+                String location =
+                        connection.getHeaderField(
+                                "Location"
+                        );
+                connection.disconnect();
+
+                if (location == null
+                        || location.isEmpty()) {
+                    throw new IllegalStateException(
+                            "下载重定向地址无效"
+                    );
+                }
+
+                currentUrl = new URL(
+                        currentUrl,
+                        location
+                );
+                continue;
+            }
+
+            if (responseCode < 200
+                    || responseCode >= 300) {
+                connection.disconnect();
+                throw new IllegalStateException(
+                        "服务器返回 " + responseCode
+                );
+            }
+
+            return connection;
+        }
+
+        throw new IllegalStateException(
+                "下载重定向次数过多"
+        );
+    }
+
+    private static boolean sameHost(
+            URL first,
+            URL second
+    ) {
+        return first.getProtocol()
+                .equalsIgnoreCase(second.getProtocol())
+                && first.getHost()
+                .equalsIgnoreCase(second.getHost())
+                && effectivePort(first)
+                == effectivePort(second);
+    }
+
+    private static int effectivePort(URL url) {
+        int port = url.getPort();
+        return port >= 0
+                ? port
+                : url.getDefaultPort();
+    }
+
+    private static String directoryForDownload(
+            String suggestedKind,
+            String mimeType,
+            String url
+    ) {
+        String kind = classifyKind(
+                suggestedKind,
+                mimeType,
+                url
+        );
+
+        if ("image".equals(kind)) {
+            return Environment.DIRECTORY_PICTURES;
+        }
+        if ("video".equals(kind)) {
+            return Environment.DIRECTORY_MOVIES;
+        }
+        return Environment.DIRECTORY_DOWNLOADS;
+    }
+
+    private static String classifyKind(
+            String suggestedKind,
+            String mimeType,
+            String url
+    ) {
+        if ("image".equalsIgnoreCase(suggestedKind)
+                || "video".equalsIgnoreCase(
+                        suggestedKind
+                )) {
+            return suggestedKind.toLowerCase(Locale.US);
+        }
+
+        String normalizedMime =
+                normalizeDownloadMimeType(
+                        mimeType,
+                        url
+                );
+
+        if (normalizedMime != null) {
+            if (normalizedMime.startsWith("image/")) {
+                return "image";
+            }
+            if (normalizedMime.startsWith("video/")) {
+                return "video";
+            }
+        }
+
+        return "file";
+    }
+
+    private static String normalizeDownloadMimeType(
+            String mimeType,
+            String url
+    ) {
+        String normalized = null;
+
+        if (mimeType != null) {
+            normalized = mimeType.trim()
+                    .toLowerCase(Locale.US);
+            int semicolon = normalized.indexOf(';');
+            if (semicolon >= 0) {
+                normalized = normalized
+                        .substring(0, semicolon)
+                        .trim();
+            }
+            if (normalized.isEmpty()
+                    || "application/octet-stream"
+                    .equals(normalized)) {
+                normalized = null;
+            }
+        }
+
+        if (normalized == null
+                && url != null) {
+            String extension =
+                    MimeTypeMap.getFileExtensionFromUrl(
+                            url
+                    );
+            if (extension != null
+                    && !extension.isEmpty()) {
+                normalized = MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(
+                                extension.toLowerCase(
+                                        Locale.US
+                                )
+                        );
+            }
+        }
+
+        return normalized;
+    }
+
+    private static String sanitizeDownloadFileName(
+            String fileName,
+            String mimeType
+    ) {
+        String safe = fileName == null
+                ? "download"
+                : fileName.trim();
+
+        safe = safe.replaceAll(
+                "[\\\\/:*?\"<>|\\p{Cntrl}]",
+                "_"
+        );
+
+        if (safe.isEmpty()
+                || ".".equals(safe)
+                || "..".equals(safe)) {
+            safe = "download";
+        }
+
+        if (!safe.contains(".")
+                && mimeType != null) {
+            String extension =
+                    MimeTypeMap.getSingleton()
+                            .getExtensionFromMimeType(
+                                    mimeType
+                            );
+            if (extension != null
+                    && !extension.isEmpty()) {
+                safe += "." + extension;
+            }
+        }
+
+        if (safe.length() > 120) {
+            int extensionIndex = safe.lastIndexOf('.');
+            String extension =
+                    extensionIndex > 0
+                            ? safe.substring(extensionIndex)
+                            : "";
+            int baseLimit = Math.max(
+                    1,
+                    120 - extension.length()
+            );
+            safe = safe.substring(0, baseLimit)
+                    + extension;
+        }
+
+        return safe;
+    }
+
+    private static boolean isStreamingPlaylist(
+            String url,
+            String mimeType
+    ) {
+        if (mimeType != null) {
+            String normalized =
+                    mimeType.toLowerCase(Locale.US);
+            if (normalized.contains("mpegurl")
+                    || normalized.contains(
+                            "dash+xml"
+                    )) {
+                return true;
+            }
+        }
+
+        String lowerUrl = url.toLowerCase(Locale.US);
+        int queryIndex = lowerUrl.indexOf('?');
+        if (queryIndex >= 0) {
+            lowerUrl = lowerUrl.substring(
+                    0,
+                    queryIndex
+            );
+        }
+
+        return lowerUrl.endsWith(".m3u8")
+                || lowerUrl.endsWith(".mpd");
+    }
+
+    private static boolean isHttpsUrl(String value) {
+        if (value == null) {
+            return false;
+        }
+
+        Uri uri = Uri.parse(value);
+        String scheme = uri.getScheme();
+
+        return "https".equalsIgnoreCase(scheme);
+    }
+
+    private static String readableMessage(
+            Exception error
+    ) {
+        String message = error.getMessage();
+        if (message == null
+                || message.trim().isEmpty()) {
+            return error.getClass().getSimpleName();
+        }
+        return message;
+    }
+
+    private void toast(String message) {
+        Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_SHORT
+        ).show();
     }
 
     private void configureAutoStatusBar() {
@@ -497,6 +1287,8 @@ public final class MainActivity extends Activity {
     private void beginStatusBarGesture(MotionEvent event) {
         touchStartX = event.getRawX();
         touchStartY = event.getRawY();
+        lastTouchViewX = event.getX();
+        lastTouchViewY = event.getY();
         touchDownTime = SystemClock.uptimeMillis();
 
         float windowWidth = root.getWidth();
@@ -880,6 +1672,23 @@ public final class MainActivity extends Activity {
                 data
         );
 
+        if (requestCode == SAVE_DOWNLOAD_REQUEST) {
+            PendingDownload download =
+                    pendingLegacyDownload;
+            pendingLegacyDownload = null;
+
+            if (resultCode == RESULT_OK
+                    && data != null
+                    && data.getData() != null
+                    && download != null) {
+                downloadToDocument(
+                        data.getData(),
+                        download
+                );
+            }
+            return;
+        }
+
         if (requestCode != FILE_CHOOSER_REQUEST
                 || pendingFileCallback == null) {
             return;
@@ -1003,6 +1812,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         unregisterBackHandler();
+        mainHandler.removeCallbacksAndMessages(null);
+        legacyDownloadExecutor.shutdownNow();
+        pendingLegacyDownload = null;
 
         if (Build.VERSION.SDK_INT
                 >= Build.VERSION_CODES.R) {
@@ -1050,6 +1862,34 @@ public final class MainActivity extends Activity {
                         .getDisplayMetrics()
                         .density
         );
+    }
+
+    private static final class PendingDownload {
+        final String url;
+        final String fileName;
+        final String mimeType;
+        final String kind;
+        final String userAgent;
+        final String cookie;
+        final String referer;
+
+        PendingDownload(
+                String url,
+                String fileName,
+                String mimeType,
+                String kind,
+                String userAgent,
+                String cookie,
+                String referer
+        ) {
+            this.url = url;
+            this.fileName = fileName;
+            this.mimeType = mimeType;
+            this.kind = kind;
+            this.userAgent = userAgent;
+            this.cookie = cookie;
+            this.referer = referer;
+        }
     }
 
     /**
