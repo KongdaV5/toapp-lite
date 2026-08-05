@@ -4,19 +4,24 @@ import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.view.DisplayCutout;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsAnimation;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.webkit.CookieManager;
 import android.webkit.MimeTypeMap;
 import android.webkit.SslErrorHandler;
@@ -55,37 +60,52 @@ import java.util.Set;
  */
 public final class MainActivity extends Activity {
     private static final int FILE_CHOOSER_REQUEST = 901;
-    private static final long STATUS_BAR_TOGGLE_COOLDOWN_MS = 220L;
-    private static final int STATUS_ACTION_NONE = 0;
-    private static final int STATUS_ACTION_HIDE = -1;
-    private static final int STATUS_ACTION_SHOW = 1;
+    private static final long LEGACY_BAR_ANIMATION_MS = 180L;
 
     private FrameLayout root;
     private FrameLayout contentContainer;
+    private View statusBarScrim;
     private WebView webView;
     private ProgressBar progressBar;
     private ValueCallback<Uri[]> pendingFileCallback;
 
+    private int statusBarOverlayHeight;
+    private boolean requestedStatusBarHidden;
+    private boolean actualStatusBarHidden;
+    private boolean statusBarTransitionPending;
+    private boolean statusBarAnimationRunning;
+    private Object activeStatusBarAnimation;
+    private float statusBarAnimationStartTranslation;
+    private float statusBarAnimationTargetTranslation;
+
     private int touchSlop;
+    private int gestureThreshold;
+    private int edgeGestureGuard;
+    private int longPressTimeout;
     private float touchStartX;
     private float touchStartY;
-    private boolean statusBarGestureHandled;
-    private int pendingStatusAction = STATUS_ACTION_NONE;
-    private boolean statusBarHidden;
-    private long lastStatusBarToggleAt;
+    private long touchDownTime;
+    private boolean touchGestureEligible;
+    private boolean touchGestureHandled;
+    private boolean touchMovedBeyondSlop;
 
-    private android.window.OnBackInvokedCallback backCallback;
+    private Object backCallback;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         WebView.setWebContentsDebuggingEnabled(false);
 
+        configureWindow();
+
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.WHITE);
 
         contentContainer = new FrameLayout(this);
+
         webView = new WebView(this);
+        webView.setBackgroundColor(Color.WHITE);
+
         progressBar = new ProgressBar(
                 this,
                 null,
@@ -109,6 +129,22 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
         ));
+
+        statusBarScrim = new View(this);
+        statusBarScrim.setBackgroundColor(Color.WHITE);
+        statusBarScrim.setClickable(false);
+        statusBarScrim.setFocusable(false);
+        statusBarScrim.setImportantForAccessibility(
+                View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        );
+
+        FrameLayout.LayoutParams scrimParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0
+        );
+        scrimParams.gravity = android.view.Gravity.TOP;
+        root.addView(statusBarScrim, scrimParams);
+
         setContentView(root);
 
         configureSystemBars();
@@ -124,17 +160,15 @@ public final class MainActivity extends Activity {
         webView.loadUrl(url);
     }
 
-    /**
-     * Applies final safe-area padding only once per inset state, then uses a compositor
-     * translation during the system status-bar animation. This avoids repeatedly resizing
-     * and relaying out the WebView on every animation frame.
-     */
-    private void configureSystemBars() {
-        getWindow().setStatusBarColor(Color.WHITE);
-        getWindow().setNavigationBarColor(Color.WHITE);
+    private void configureWindow() {
+        Window window = getWindow();
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.WHITE);
 
-        View decorView = getWindow().getDecorView();
-        int visibility = decorView.getSystemUiVisibility();
+        View decorView = window.getDecorView();
+        int visibility = decorView.getSystemUiVisibility()
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             visibility |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
@@ -144,172 +178,154 @@ public final class MainActivity extends Activity {
         }
         decorView.setSystemUiVisibility(visibility);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            getWindow().setDecorFitsSystemWindows(false);
-
-            WindowInsetsController controller = getWindow().getInsetsController();
-            if (controller != null) {
-                controller.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_DEFAULT
-                );
-            }
-
-            root.setOnApplyWindowInsetsListener((view, insets) -> {
-                android.graphics.Insets status = insets.getInsets(
-                        WindowInsets.Type.statusBars()
-                );
-                android.graphics.Insets navigation = insets.getInsets(
-                        WindowInsets.Type.navigationBars()
-                );
-                android.graphics.Insets cutout = insets.getInsets(
-                        WindowInsets.Type.displayCutout()
-                );
-                android.graphics.Insets ime = insets.getInsets(
-                        WindowInsets.Type.ime()
-                );
-
-                boolean statusVisible = insets.isVisible(
-                        WindowInsets.Type.statusBars()
-                );
-                statusBarHidden = !statusVisible;
-
-                int leftPadding = Math.max(
-                        Math.max(status.left, navigation.left),
-                        cutout.left
-                );
-                int rightPadding = Math.max(
-                        Math.max(status.right, navigation.right),
-                        cutout.right
-                );
-                int topPadding = statusVisible
-                        ? Math.max(status.top, cutout.top)
-                        : 0;
-                int bottomPadding = Math.max(
-                        navigation.bottom,
-                        ime.bottom
-                );
-
-                if (view.getPaddingLeft() != leftPadding
-                        || view.getPaddingTop() != topPadding
-                        || view.getPaddingRight() != rightPadding
-                        || view.getPaddingBottom() != bottomPadding) {
-                    view.setPadding(
-                            leftPadding,
-                            topPadding,
-                            rightPadding,
-                            bottomPadding
-                    );
-                }
-
-                /*
-                 * The native root has already consumed these dimensions as padding.
-                 * Zero them before dispatching to WebView so WebView does not apply the
-                 * same system-bar/IME adjustment a second time.
-                 */
-                return new WindowInsets.Builder(insets)
-                        .setInsets(
-                                WindowInsets.Type.statusBars()
-                                        | WindowInsets.Type.navigationBars()
-                                        | WindowInsets.Type.displayCutout()
-                                        | WindowInsets.Type.ime(),
-                                android.graphics.Insets.NONE
-                        )
-                        .build();
-            });
-
-            root.setWindowInsetsAnimationCallback(
-                    new WindowInsetsAnimation.Callback(
-                            WindowInsetsAnimation.Callback
-                                    .DISPATCH_MODE_CONTINUE_ON_SUBTREE
-                    ) {
-                        private int startContentY;
-                        private int translationDeltaY;
-                        private boolean statusAnimationRunning;
-
-                        @Override
-                        public void onPrepare(WindowInsetsAnimation animation) {
-                            if (!isStatusBarAnimation(animation)) {
-                                return;
-                            }
-
-                            contentContainer.animate().cancel();
-                            contentContainer.setTranslationY(0f);
-
-                            int[] location = new int[2];
-                            contentContainer.getLocationOnScreen(location);
-                            startContentY = location[1];
-                            translationDeltaY = 0;
-                            statusAnimationRunning = true;
-                        }
-
-                        @Override
-                        public WindowInsetsAnimation.Bounds onStart(
-                                WindowInsetsAnimation animation,
-                                WindowInsetsAnimation.Bounds bounds
-                        ) {
-                            if (!isStatusBarAnimation(animation)) {
-                                return bounds;
-                            }
-
-                            int[] location = new int[2];
-                            contentContainer.getLocationOnScreen(location);
-                            translationDeltaY = startContentY - location[1];
-
-                            /*
-                             * The layout has already jumped to its final inset state.
-                             * Apply the inverse translation immediately so the user sees
-                             * no jump, then let onProgress remove it smoothly.
-                             */
-                            contentContainer.setTranslationY(translationDeltaY);
-                            return bounds;
-                        }
-
-                        @Override
-                        public WindowInsets onProgress(
-                                WindowInsets insets,
-                                List<WindowInsetsAnimation> runningAnimations
-                        ) {
-                            if (!statusAnimationRunning) {
-                                return insets;
-                            }
-
-                            for (WindowInsetsAnimation animation : runningAnimations) {
-                                if (!isStatusBarAnimation(animation)) {
-                                    continue;
-                                }
-
-                                float fraction = animation.getInterpolatedFraction();
-                                contentContainer.setTranslationY(
-                                        translationDeltaY * (1f - fraction)
-                                );
-                                break;
-                            }
-                            return insets;
-                        }
-
-                        @Override
-                        public void onEnd(WindowInsetsAnimation animation) {
-                            if (!isStatusBarAnimation(animation)) {
-                                return;
-                            }
-
-                            contentContainer.setTranslationY(0f);
-                            translationDeltaY = 0;
-                            statusAnimationRunning = false;
-                        }
-                    }
-            );
-
-            root.post(root::requestApplyInsets);
-        } else {
-            root.setFitsSystemWindows(true);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams
+                            .LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(attributes);
         }
     }
 
-    private static boolean isStatusBarAnimation(
-            WindowInsetsAnimation animation
+    /**
+     * The WebView remains the same height whether the status bar is shown or hidden.
+     * A native overlay follows the status bar animation instead of resizing the page.
+     */
+    private void configureSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Api30SystemBars.install(this);
+        } else {
+            configureLegacySystemBars();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void configureLegacySystemBars() {
+        root.setFitsSystemWindows(false);
+
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int topInset = insets.getSystemWindowInsetTop();
+            int leftInset = 0;
+            int rightInset = 0;
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                DisplayCutout cutout = insets.getDisplayCutout();
+                if (cutout != null) {
+                    topInset = Math.max(topInset, cutout.getSafeInsetTop());
+                    leftInset = cutout.getSafeInsetLeft();
+                    rightInset = cutout.getSafeInsetRight();
+                }
+            }
+
+            updateHorizontalCutoutPadding(leftInset, rightInset);
+            updateStatusBarOverlayHeight(topInset);
+
+            int visibility = getWindow().getDecorView()
+                    .getSystemUiVisibility();
+            boolean hidden =
+                    (visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) != 0;
+            actualStatusBarHidden = hidden;
+
+            if (!statusBarAnimationRunning
+                    && !statusBarTransitionPending) {
+                setScrimToFinalState(hidden);
+            }
+
+            /*
+             * Remove only top/side native insets before WebView receives them.
+             * Keep the bottom inset so WebView still receives navigation bar and
+             * keyboard overlap information.
+             */
+            return insets.replaceSystemWindowInsets(
+                    0,
+                    0,
+                    0,
+                    insets.getSystemWindowInsetBottom()
+            );
+        });
+
+        getWindow().getDecorView()
+                .setOnSystemUiVisibilityChangeListener(visibility -> {
+                    boolean hidden =
+                            (visibility & View.SYSTEM_UI_FLAG_FULLSCREEN) != 0;
+                    boolean alreadyAnimatingTarget =
+                            statusBarAnimationRunning
+                                    && requestedStatusBarHidden == hidden;
+
+                    actualStatusBarHidden = hidden;
+                    requestedStatusBarHidden = hidden;
+                    statusBarTransitionPending = false;
+
+                    if (!alreadyAnimatingTarget) {
+                        animateLegacyScrim(hidden);
+                    }
+
+                    root.requestApplyInsets();
+                });
+
+        root.post(root::requestApplyInsets);
+    }
+
+    private void updateHorizontalCutoutPadding(
+            int leftInset,
+            int rightInset
     ) {
-        return (animation.getTypeMask() & WindowInsets.Type.statusBars()) != 0;
+        if (contentContainer.getPaddingLeft() == leftInset
+                && contentContainer.getPaddingRight() == rightInset) {
+            return;
+        }
+
+        contentContainer.setPadding(
+                leftInset,
+                0,
+                rightInset,
+                0
+        );
+    }
+
+    private void updateStatusBarOverlayHeight(int height) {
+        int safeHeight = Math.max(0, height);
+        if (statusBarOverlayHeight == safeHeight) {
+            return;
+        }
+
+        statusBarOverlayHeight = safeHeight;
+
+        ViewGroup.LayoutParams rawParams =
+                statusBarScrim.getLayoutParams();
+        if (rawParams.height != safeHeight) {
+            rawParams.height = safeHeight;
+            statusBarScrim.setLayoutParams(rawParams);
+        }
+
+        if (!statusBarAnimationRunning
+                && !statusBarTransitionPending) {
+            setScrimToFinalState(actualStatusBarHidden);
+        }
+    }
+
+    private void setScrimToFinalState(boolean hidden) {
+        statusBarScrim.animate().cancel();
+        statusBarScrim.setTranslationY(
+                hidden ? -statusBarOverlayHeight : 0f
+        );
+    }
+
+    private void animateLegacyScrim(boolean hidden) {
+        statusBarAnimationRunning = true;
+        statusBarScrim.animate().cancel();
+        statusBarScrim.animate()
+                .translationY(
+                        hidden ? -statusBarOverlayHeight : 0f
+                )
+                .setDuration(LEGACY_BAR_ANIMATION_MS)
+                .setInterpolator(new DecelerateInterpolator())
+                .withEndAction(() -> {
+                    statusBarAnimationRunning = false;
+                    statusBarTransitionPending = false;
+                    setScrimToFinalState(actualStatusBarHidden);
+                })
+                .start();
     }
 
     private void configureWebView() {
@@ -318,11 +334,12 @@ public final class MainActivity extends Activity {
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(false);
         settings.setAllowFileAccess(false);
-        // Required for content:// URIs returned by Android's system file picker.
         settings.setAllowContentAccess(true);
         settings.setAllowFileAccessFromFileURLs(false);
         settings.setAllowUniversalAccessFromFileURLs(false);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        settings.setMixedContentMode(
+                WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        );
         settings.setMediaPlaybackRequiresUserGesture(true);
         settings.setSaveFormData(false);
         settings.setGeolocationEnabled(false);
@@ -331,12 +348,12 @@ public final class MainActivity extends Activity {
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
 
-        // Some sites hide upload controls when they detect the generic Android WebView UA.
-        // Keep the real Chrome/WebView version while removing only embedded-view markers.
         String userAgent = settings.getUserAgentString();
         if (userAgent != null) {
             settings.setUserAgentString(
-                    userAgent.replace("; wv", "").replace("Version/4.0 ", "")
+                    userAgent
+                            .replace("; wv", "")
+                            .replace("Version/4.0 ", "")
             );
         }
 
@@ -355,7 +372,10 @@ public final class MainActivity extends Activity {
 
             @SuppressWarnings("deprecation")
             @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+            public boolean shouldOverrideUrlLoading(
+                    WebView view,
+                    String url
+            ) {
                 return handleNavigation(Uri.parse(url));
             }
 
@@ -378,7 +398,10 @@ public final class MainActivity extends Activity {
             }
 
             @Override
-            public void onPageFinished(WebView view, String url) {
+            public void onPageFinished(
+                    WebView view,
+                    String url
+            ) {
                 progressBar.setProgress(100);
                 progressBar.setVisibility(View.GONE);
             }
@@ -386,10 +409,15 @@ public final class MainActivity extends Activity {
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
-            public void onProgressChanged(WebView view, int newProgress) {
+            public void onProgressChanged(
+                    WebView view,
+                    int newProgress
+            ) {
                 progressBar.setProgress(newProgress);
                 progressBar.setVisibility(
-                        newProgress >= 100 ? View.GONE : View.VISIBLE
+                        newProgress >= 100
+                                ? View.GONE
+                                : View.VISIBLE
                 );
             }
 
@@ -415,7 +443,10 @@ public final class MainActivity extends Activity {
                 contentLength
         ) -> {
             try {
-                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                Intent intent = new Intent(
+                        Intent.ACTION_VIEW,
+                        Uri.parse(url)
+                );
                 startActivity(intent);
             } catch (ActivityNotFoundException ignored) {
                 // No compatible external application.
@@ -424,141 +455,212 @@ public final class MainActivity extends Activity {
     }
 
     private void configureAutoStatusBar() {
-        touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
-        final int gestureThreshold = dp(28);
+        ViewConfiguration configuration =
+                ViewConfiguration.get(this);
+
+        touchSlop = configuration.getScaledTouchSlop();
+        gestureThreshold = dp(28);
+        edgeGestureGuard = dp(28);
+        longPressTimeout = ViewConfiguration.getLongPressTimeout();
 
         webView.setOnTouchListener((view, event) -> {
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
-                    touchStartX = event.getRawX();
-                    touchStartY = event.getRawY();
-                    statusBarGestureHandled = false;
-                    pendingStatusAction = STATUS_ACTION_NONE;
+                    beginStatusBarGesture(event);
+                    break;
+
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    cancelStatusBarGesture();
                     break;
 
                 case MotionEvent.ACTION_MOVE:
-                    if (statusBarGestureHandled) {
-                        break;
-                    }
-
-                    float movedX = event.getRawX() - touchStartX;
-                    float movedY = event.getRawY() - touchStartY;
-
-                    if (Math.abs(movedY) > Math.abs(movedX)
-                            && Math.abs(movedY) >= gestureThreshold) {
-                        pendingStatusAction = movedY < 0f
-                                ? STATUS_ACTION_HIDE
-                                : STATUS_ACTION_SHOW;
-                        statusBarGestureHandled = true;
-                    }
+                    updateStatusBarGesture(event);
                     break;
 
                 case MotionEvent.ACTION_UP:
-                    float totalX = Math.abs(event.getRawX() - touchStartX);
-                    float totalY = Math.abs(event.getRawY() - touchStartY);
-
-                    if (statusBarGestureHandled) {
-                        int action = pendingStatusAction;
-
-                        /*
-                         * Do not resize the WebView while the finger is still driving
-                         * an active scroll. Start the bar transition on the next frame
-                         * after ACTION_UP.
-                         */
-                        view.postOnAnimation(() -> applyStatusAction(action));
-                    } else if (totalX <= touchSlop && totalY <= touchSlop) {
-                        view.postOnAnimation(this::showStatusBar);
-                    }
-
-                    statusBarGestureHandled = false;
-                    pendingStatusAction = STATUS_ACTION_NONE;
+                    finishStatusBarGesture(view, event);
                     break;
 
                 case MotionEvent.ACTION_CANCEL:
-                    statusBarGestureHandled = false;
-                    pendingStatusAction = STATUS_ACTION_NONE;
+                case MotionEvent.ACTION_POINTER_UP:
+                    cancelStatusBarGesture();
                     break;
 
                 default:
                     break;
             }
 
-            // Keep WebView clicks, scrolling, selection and uploads untouched.
             return false;
         });
     }
 
-    private void applyStatusAction(int action) {
-        if (action == STATUS_ACTION_HIDE) {
-            hideStatusBar();
-        } else if (action == STATUS_ACTION_SHOW) {
-            showStatusBar();
-        }
+    private void beginStatusBarGesture(MotionEvent event) {
+        touchStartX = event.getRawX();
+        touchStartY = event.getRawY();
+        touchDownTime = SystemClock.uptimeMillis();
+
+        float windowWidth = root.getWidth();
+        boolean startsNearSystemBackEdge =
+                touchStartX <= edgeGestureGuard
+                        || touchStartX
+                        >= windowWidth - edgeGestureGuard;
+
+        touchGestureEligible =
+                event.getPointerCount() == 1
+                        && !startsNearSystemBackEdge;
+        touchGestureHandled = false;
+        touchMovedBeyondSlop = false;
     }
 
-    private boolean canToggleStatusBar() {
-        long now = SystemClock.uptimeMillis();
-        if (now - lastStatusBarToggleAt < STATUS_BAR_TOGGLE_COOLDOWN_MS) {
-            return false;
+    private void updateStatusBarGesture(MotionEvent event) {
+        if (!touchGestureEligible
+                || touchGestureHandled
+                || event.getPointerCount() != 1) {
+            return;
         }
-        lastStatusBarToggleAt = now;
-        return true;
+
+        float movedX = event.getRawX() - touchStartX;
+        float movedY = event.getRawY() - touchStartY;
+
+        if (Math.abs(movedX) > touchSlop
+                || Math.abs(movedY) > touchSlop) {
+            touchMovedBeyondSlop = true;
+        }
+
+        boolean clearlyVertical =
+                Math.abs(movedY)
+                        > Math.abs(movedX) * 1.25f;
+
+        if (!clearlyVertical
+                || Math.abs(movedY) < gestureThreshold) {
+            return;
+        }
+
+        if (movedY < 0f) {
+            hideStatusBar();
+        } else {
+            showStatusBar();
+        }
+
+        touchGestureHandled = true;
+    }
+
+    private void finishStatusBarGesture(
+            View view,
+            MotionEvent event
+    ) {
+        long pressDuration =
+                SystemClock.uptimeMillis() - touchDownTime;
+
+        float movedX = Math.abs(
+                event.getRawX() - touchStartX
+        );
+        float movedY = Math.abs(
+                event.getRawY() - touchStartY
+        );
+
+        boolean simpleTap =
+                touchGestureEligible
+                        && !touchGestureHandled
+                        && !touchMovedBeyondSlop
+                        && movedX <= touchSlop
+                        && movedY <= touchSlop
+                        && pressDuration < longPressTimeout;
+
+        if (simpleTap) {
+            /*
+             * The page keeps a constant viewport, so showing the bar after
+             * the click does not resize the WebView or move the clicked target.
+             */
+            view.postOnAnimation(this::showStatusBar);
+        }
+
+        cancelStatusBarGesture();
+    }
+
+    private void cancelStatusBarGesture() {
+        touchGestureEligible = false;
+        touchGestureHandled = false;
+        touchMovedBeyondSlop = false;
     }
 
     private void hideStatusBar() {
-        if (statusBarHidden || !canToggleStatusBar()) {
-            return;
-        }
-
-        statusBarHidden = true;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            WindowInsetsController controller = getWindow().getInsetsController();
-            if (controller != null) {
-                controller.hide(WindowInsets.Type.statusBars());
-            }
-        } else {
-            View decorView = getWindow().getDecorView();
-            decorView.setSystemUiVisibility(
-                    decorView.getSystemUiVisibility()
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            );
-        }
+        requestStatusBarVisibility(true);
     }
 
     private void showStatusBar() {
-        if (!statusBarHidden || !canToggleStatusBar()) {
+        requestStatusBarVisibility(false);
+    }
+
+    private void requestStatusBarVisibility(boolean hidden) {
+        if (requestedStatusBarHidden == hidden
+                && actualStatusBarHidden == hidden
+                && !statusBarTransitionPending
+                && !statusBarAnimationRunning) {
             return;
         }
 
-        statusBarHidden = false;
+        requestedStatusBarHidden = hidden;
+        statusBarTransitionPending = true;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            WindowInsetsController controller = getWindow().getInsetsController();
-            if (controller != null) {
-                controller.show(WindowInsets.Type.statusBars());
-            }
+            Api30SystemBars.setHidden(this, hidden);
         } else {
-            View decorView = getWindow().getDecorView();
-            int visibility = decorView.getSystemUiVisibility();
-
-            visibility &= ~View.SYSTEM_UI_FLAG_FULLSCREEN;
-            visibility &= ~View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
-
-            decorView.setSystemUiVisibility(visibility);
+            setLegacyStatusBarHidden(hidden);
         }
     }
 
-    private void registerBackHandler() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            backCallback = this::handleBackNavigation;
+    @SuppressWarnings("deprecation")
+    private void setLegacyStatusBarHidden(boolean hidden) {
+        View decorView = getWindow().getDecorView();
+        int currentVisibility = decorView.getSystemUiVisibility();
+        boolean currentlyHidden =
+                (currentVisibility & View.SYSTEM_UI_FLAG_FULLSCREEN) != 0;
 
-            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
-                    android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
-                    backCallback
+        int visibility = currentVisibility
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            visibility |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            visibility |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+
+        if (hidden) {
+            visibility |= View.SYSTEM_UI_FLAG_FULLSCREEN;
+        } else {
+            visibility &= ~View.SYSTEM_UI_FLAG_FULLSCREEN;
+        }
+
+        if (currentlyHidden == hidden) {
+            actualStatusBarHidden = hidden;
+            statusBarTransitionPending = false;
+            setScrimToFinalState(hidden);
+            return;
+        }
+
+        animateLegacyScrim(hidden);
+        decorView.setSystemUiVisibility(visibility);
+    }
+
+    private void registerBackHandler() {
+        if (Build.VERSION.SDK_INT
+                >= Build.VERSION_CODES.TIRAMISU) {
+            backCallback = Api33BackHandler.register(
+                    this,
+                    this::handleBackNavigation
             );
+        }
+    }
+
+    private void unregisterBackHandler() {
+        if (Build.VERSION.SDK_INT
+                >= Build.VERSION_CODES.TIRAMISU
+                && backCallback != null) {
+            Api33BackHandler.unregister(this, backCallback);
+            backCallback = null;
         }
     }
 
@@ -573,48 +675,80 @@ public final class MainActivity extends Activity {
     private boolean launchSystemFilePicker(
             WebChromeClient.FileChooserParams params
     ) {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        Intent intent = new Intent(
+                Intent.ACTION_OPEN_DOCUMENT
+        );
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+        );
 
-        String[] mimeTypes = normalizeMimeTypes(params.getAcceptTypes());
+        String[] mimeTypes = normalizeMimeTypes(
+                params.getAcceptTypes()
+        );
+
         if (mimeTypes.length == 1) {
             intent.setType(mimeTypes[0]);
         } else {
             intent.setType("*/*");
             if (mimeTypes.length > 1) {
-                intent.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes);
+                intent.putExtra(
+                        Intent.EXTRA_MIME_TYPES,
+                        mimeTypes
+                );
             }
         }
+
         intent.putExtra(
                 Intent.EXTRA_ALLOW_MULTIPLE,
                 params.getMode()
-                        == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+                        == WebChromeClient.FileChooserParams
+                        .MODE_OPEN_MULTIPLE
         );
 
         try {
-            startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+            startActivityForResult(
+                    intent,
+                    FILE_CHOOSER_REQUEST
+            );
             return true;
         } catch (ActivityNotFoundException firstError) {
-            Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
-            fallback.addCategory(Intent.CATEGORY_OPENABLE);
-            fallback.setType(
-                    mimeTypes.length == 1 ? mimeTypes[0] : "*/*"
+            Intent fallback = new Intent(
+                    Intent.ACTION_GET_CONTENT
             );
+            fallback.addCategory(
+                    Intent.CATEGORY_OPENABLE
+            );
+            fallback.setType(
+                    mimeTypes.length == 1
+                            ? mimeTypes[0]
+                            : "*/*"
+            );
+
             if (mimeTypes.length > 1) {
-                fallback.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes);
+                fallback.putExtra(
+                        Intent.EXTRA_MIME_TYPES,
+                        mimeTypes
+                );
             }
+
             fallback.putExtra(
                     Intent.EXTRA_ALLOW_MULTIPLE,
                     params.getMode()
-                            == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+                            == WebChromeClient.FileChooserParams
+                            .MODE_OPEN_MULTIPLE
             );
+
             try {
-                startActivityForResult(fallback, FILE_CHOOSER_REQUEST);
+                startActivityForResult(
+                        fallback,
+                        FILE_CHOOSER_REQUEST
+                );
                 return true;
             } catch (ActivityNotFoundException secondError) {
                 if (pendingFileCallback != null) {
-                    pendingFileCallback.onReceiveValue(null);
+                    pendingFileCallback
+                            .onReceiveValue(null);
                     pendingFileCallback = null;
                 }
                 return false;
@@ -622,22 +756,36 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private static String[] normalizeMimeTypes(String[] acceptTypes) {
-        Set<String> normalized = new LinkedHashSet<>();
+    private static String[] normalizeMimeTypes(
+            String[] acceptTypes
+    ) {
+        Set<String> normalized =
+                new LinkedHashSet<>();
+
         if (acceptTypes != null) {
             for (String acceptType : acceptTypes) {
                 if (acceptType == null) {
                     continue;
                 }
-                for (String token : acceptType.split(",")) {
-                    String value = token.trim().toLowerCase(Locale.US);
+
+                for (String token
+                        : acceptType.split(",")) {
+                    String value = token
+                            .trim()
+                            .toLowerCase(Locale.US);
+
                     if (value.isEmpty()) {
                         continue;
                     }
+
                     if (value.startsWith(".")) {
-                        String extension = value.substring(1);
-                        String mime = MimeTypeMap.getSingleton()
-                                .getMimeTypeFromExtension(extension);
+                        String extension =
+                                value.substring(1);
+                        String mime =
+                                MimeTypeMap.getSingleton()
+                                        .getMimeTypeFromExtension(
+                                                extension
+                                        );
                         if (mime != null) {
                             normalized.add(mime);
                         }
@@ -647,35 +795,49 @@ public final class MainActivity extends Activity {
                 }
             }
         }
+
         if (normalized.isEmpty()) {
             normalized.add("*/*");
         }
+
         return normalized.toArray(new String[0]);
     }
 
     private boolean handleNavigation(Uri uri) {
         String scheme = uri.getScheme();
+
         if ("https".equalsIgnoreCase(scheme)) {
             return false;
         }
+
         try {
-            startActivity(new Intent(Intent.ACTION_VIEW, uri));
+            startActivity(new Intent(
+                    Intent.ACTION_VIEW,
+                    uri
+            ));
         } catch (ActivityNotFoundException ignored) {
             // Ignore unsupported custom schemes.
         }
+
         return true;
     }
 
     private String readConfiguredUrl() {
-        try (InputStream input = getAssets().open("app_config.json")) {
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (InputStream input = getAssets()
+                .open("app_config.json")) {
+            ByteArrayOutputStream output =
+                    new ByteArrayOutputStream();
             byte[] buffer = new byte[4096];
             int read;
+
             while ((read = input.read(buffer)) != -1) {
                 output.write(buffer, 0, read);
             }
+
             JSONObject json = new JSONObject(
-                    output.toString(StandardCharsets.UTF_8.name())
+                    output.toString(
+                            StandardCharsets.UTF_8.name()
+                    )
             );
             return json.optString("url", null);
         } catch (Exception error) {
@@ -688,15 +850,22 @@ public final class MainActivity extends Activity {
         progressBar.setVisibility(View.GONE);
 
         TextView error = new TextView(this);
-        error.setText("应用配置无效：仅支持 HTTPS 地址。");
+        error.setText(
+                "应用配置无效：仅支持 HTTPS 地址。"
+        );
         error.setTextColor(Color.DKGRAY);
         error.setTextSize(17f);
-        error.setGravity(android.view.Gravity.CENTER);
+        error.setGravity(
+                android.view.Gravity.CENTER
+        );
 
-        contentContainer.addView(error, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+        contentContainer.addView(
+                error,
+                new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                )
+        );
     }
 
     @Override
@@ -705,26 +874,47 @@ public final class MainActivity extends Activity {
             int resultCode,
             Intent data
     ) {
-        super.onActivityResult(requestCode, resultCode, data);
+        super.onActivityResult(
+                requestCode,
+                resultCode,
+                data
+        );
+
         if (requestCode != FILE_CHOOSER_REQUEST
                 || pendingFileCallback == null) {
             return;
         }
 
         Uri[] result = null;
-        if (resultCode == RESULT_OK && data != null) {
+
+        if (resultCode == RESULT_OK
+                && data != null) {
             ClipData clipData = data.getClipData();
-            if (clipData != null && clipData.getItemCount() > 0) {
-                ArrayList<Uri> selected = new ArrayList<>();
-                for (int index = 0; index < clipData.getItemCount(); index++) {
-                    Uri uri = clipData.getItemAt(index).getUri();
+
+            if (clipData != null
+                    && clipData.getItemCount() > 0) {
+                ArrayList<Uri> selected =
+                        new ArrayList<>();
+
+                for (int index = 0;
+                        index < clipData.getItemCount();
+                        index++) {
+                    Uri uri = clipData
+                            .getItemAt(index)
+                            .getUri();
+
                     if (uri != null) {
                         selected.add(uri);
                     }
                 }
-                result = selected.toArray(new Uri[0]);
+
+                result = selected.toArray(
+                        new Uri[0]
+                );
             } else if (data.getData() != null) {
-                result = new Uri[]{data.getData()};
+                result = new Uri[]{
+                        data.getData()
+                };
             }
         }
 
@@ -739,30 +929,110 @@ public final class MainActivity extends Activity {
     }
 
     @Override
-    protected void onDestroy() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-                && backCallback != null) {
-            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
-                    backCallback
+    protected void onPause() {
+        cancelStatusBarGesture();
+        statusBarScrim.animate().cancel();
+        statusBarAnimationRunning = false;
+        activeStatusBarAnimation = null;
+        statusBarTransitionPending = false;
+        setScrimToFinalState(actualStatusBarHidden);
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+
+        if (root != null) {
+            root.post(() -> {
+                root.requestApplyInsets();
+                reapplyRequestedStatusBarState();
+            });
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(
+            boolean hasFocus
+    ) {
+        super.onWindowFocusChanged(hasFocus);
+
+        if (hasFocus && root != null) {
+            root.post(() -> {
+                root.requestApplyInsets();
+                reapplyRequestedStatusBarState();
+            });
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(
+            Configuration newConfig
+    ) {
+        super.onConfigurationChanged(newConfig);
+        cancelStatusBarGesture();
+        statusBarScrim.animate().cancel();
+        statusBarAnimationRunning = false;
+        activeStatusBarAnimation = null;
+        statusBarTransitionPending = false;
+
+        if (root != null) {
+            root.post(() -> {
+                root.requestApplyInsets();
+                reapplyRequestedStatusBarState();
+            });
+        }
+    }
+
+    private void reapplyRequestedStatusBarState() {
+        statusBarTransitionPending = true;
+
+        if (Build.VERSION.SDK_INT
+                >= Build.VERSION_CODES.R) {
+            Api30SystemBars.setHidden(
+                    this,
+                    requestedStatusBarHidden
             );
-            backCallback = null;
+        } else {
+            setLegacyStatusBarHidden(
+                    requestedStatusBarHidden
+            );
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        unregisterBackHandler();
+
+        if (Build.VERSION.SDK_INT
+                >= Build.VERSION_CODES.R) {
+            Api30SystemBars.remove(this);
+        } else if (root != null) {
+            root.setOnApplyWindowInsetsListener(null);
+            getWindow().getDecorView()
+                    .setOnSystemUiVisibilityChangeListener(
+                            null
+                    );
         }
 
-        if (root != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            root.setWindowInsetsAnimationCallback(null);
-            root.setOnApplyWindowInsetsListener(null);
+        if (statusBarScrim != null) {
+            statusBarScrim.animate().cancel();
         }
 
         if (pendingFileCallback != null) {
-            pendingFileCallback.onReceiveValue(null);
+            pendingFileCallback
+                    .onReceiveValue(null);
             pendingFileCallback = null;
         }
 
         if (webView != null) {
-            ViewGroup parent = (ViewGroup) webView.getParent();
+            ViewGroup parent =
+                    (ViewGroup) webView.getParent();
+
             if (parent != null) {
                 parent.removeView(webView);
             }
+
             webView.stopLoading();
             webView.clearHistory();
             webView.removeAllViews();
@@ -775,7 +1045,437 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(
-                value * getResources().getDisplayMetrics().density
+                value
+                        * getResources()
+                        .getDisplayMetrics()
+                        .density
         );
+    }
+
+    /**
+     * API 30+ implementation is isolated so older Android versions do not need
+     * to resolve WindowInsetsAnimation and WindowInsetsController classes.
+     */
+    private static final class Api30SystemBars {
+        private Api30SystemBars() {
+        }
+
+        static void install(MainActivity activity) {
+            Window window = activity.getWindow();
+            window.setDecorFitsSystemWindows(false);
+
+            WindowInsetsController controller =
+                    window.getInsetsController();
+
+            if (controller != null) {
+                controller.setSystemBarsBehavior(
+                        WindowInsetsController
+                                .BEHAVIOR_DEFAULT
+                );
+                controller.setSystemBarsAppearance(
+                        WindowInsetsController
+                                .APPEARANCE_LIGHT_STATUS_BARS,
+                        WindowInsetsController
+                                .APPEARANCE_LIGHT_STATUS_BARS
+                );
+            }
+
+            activity.root.setOnApplyWindowInsetsListener(
+                    (view, insets) -> {
+                        android.graphics.Insets
+                                stableStatus =
+                                insets.getInsetsIgnoringVisibility(
+                                        WindowInsets.Type
+                                                .statusBars()
+                                );
+
+                        android.graphics.Insets
+                                stableCutout =
+                                insets.getInsetsIgnoringVisibility(
+                                        WindowInsets.Type
+                                                .displayCutout()
+                                );
+
+                        int overlayHeight = Math.max(
+                                stableStatus.top,
+                                stableCutout.top
+                        );
+
+                        activity.updateHorizontalCutoutPadding(
+                                stableCutout.left,
+                                stableCutout.right
+                        );
+                        activity.updateStatusBarOverlayHeight(
+                                overlayHeight
+                        );
+
+                        boolean hidden =
+                                !insets.isVisible(
+                                        WindowInsets.Type
+                                                .statusBars()
+                                );
+
+                        activity.actualStatusBarHidden =
+                                hidden;
+
+                        if (!activity.statusBarAnimationRunning
+                                && !activity
+                                .statusBarTransitionPending) {
+                            activity.setScrimToFinalState(
+                                    hidden
+                            );
+                        }
+
+                        /*
+                         * WebView keeps receiving navigation-bar and IME insets.
+                         * Only the top status-bar/cutout insets are handled by
+                         * the native overlay, so the page viewport does not resize
+                         * when the status bar toggles.
+                         */
+                        return new WindowInsets.Builder(
+                                insets
+                        )
+                                .setInsets(
+                                        WindowInsets.Type
+                                                .statusBars()
+                                                | WindowInsets.Type
+                                                .displayCutout(),
+                                        android.graphics.Insets
+                                                .NONE
+                                )
+                                .setInsetsIgnoringVisibility(
+                                        WindowInsets.Type
+                                                .statusBars()
+                                                | WindowInsets.Type
+                                                .displayCutout(),
+                                        android.graphics.Insets
+                                                .NONE
+                                )
+                                .setVisible(
+                                        WindowInsets.Type
+                                                .statusBars(),
+                                        false
+                                )
+                                .setDisplayCutout(null)
+                                .build();
+                    }
+            );
+
+            activity.root
+                    .setWindowInsetsAnimationCallback(
+                            new WindowInsetsAnimation.Callback(
+                                    WindowInsetsAnimation
+                                            .Callback
+                                            .DISPATCH_MODE_CONTINUE_ON_SUBTREE
+                            ) {
+                                @Override
+                                public void onPrepare(
+                                        WindowInsetsAnimation animation
+                                ) {
+                                    if (!isStatusBarAnimation(
+                                            animation
+                                    )) {
+                                        return;
+                                    }
+
+                                    activity.statusBarScrim
+                                            .animate()
+                                            .cancel();
+
+                                    boolean requestedTransition =
+                                            activity
+                                                    .statusBarTransitionPending;
+
+                                    activity
+                                            .statusBarAnimationRunning =
+                                            true;
+                                    activity
+                                            .activeStatusBarAnimation =
+                                            animation;
+                                    activity
+                                            .statusBarTransitionPending =
+                                            false;
+
+                                    activity
+                                            .statusBarAnimationStartTranslation =
+                                            activity.statusBarScrim
+                                                    .getTranslationY();
+
+                                    boolean targetHidden =
+                                            requestedTransition
+                                                    ? activity
+                                                    .requestedStatusBarHidden
+                                                    : !activity
+                                                    .actualStatusBarHidden;
+
+                                    activity
+                                            .requestedStatusBarHidden =
+                                            targetHidden;
+                                    activity
+                                            .statusBarAnimationTargetTranslation =
+                                            targetHidden
+                                                    ? -activity
+                                                    .statusBarOverlayHeight
+                                                    : 0f;
+                                }
+
+                                @Override
+                                public WindowInsets onProgress(
+                                        WindowInsets insets,
+                                        List<WindowInsetsAnimation>
+                                                runningAnimations
+                                ) {
+                                    if (!activity
+                                            .statusBarAnimationRunning) {
+                                        return insets;
+                                    }
+
+                                    for (WindowInsetsAnimation
+                                            animation
+                                            : runningAnimations) {
+                                        if (!isStatusBarAnimation(
+                                                animation
+                                        )
+                                                || activity
+                                                .activeStatusBarAnimation
+                                                != animation) {
+                                            continue;
+                                        }
+
+                                        float fraction =
+                                                animation
+                                                        .getInterpolatedFraction();
+
+                                        float start =
+                                                activity
+                                                        .statusBarAnimationStartTranslation;
+                                        float end =
+                                                activity
+                                                        .statusBarAnimationTargetTranslation;
+
+                                        activity.statusBarScrim
+                                                .setTranslationY(
+                                                        start
+                                                                + (
+                                                                end
+                                                                        - start
+                                                        )
+                                                                * fraction
+                                                );
+                                        break;
+                                    }
+
+                                    return insets;
+                                }
+
+                                @Override
+                                public void onEnd(
+                                        WindowInsetsAnimation animation
+                                ) {
+                                    if (!isStatusBarAnimation(
+                                            animation
+                                    )
+                                            || activity
+                                            .activeStatusBarAnimation
+                                            != animation) {
+                                        return;
+                                    }
+
+                                    activity
+                                            .activeStatusBarAnimation =
+                                            null;
+                                    activity
+                                            .statusBarAnimationRunning =
+                                            false;
+                                    activity
+                                            .statusBarTransitionPending =
+                                            false;
+
+                                    WindowInsets currentInsets =
+                                            activity.root
+                                                    .getRootWindowInsets();
+
+                                    if (currentInsets != null) {
+                                        boolean hidden =
+                                                !currentInsets
+                                                        .isVisible(
+                                                                WindowInsets.Type
+                                                                        .statusBars()
+                                                        );
+                                        activity
+                                            .actualStatusBarHidden =
+                                            hidden;
+                                        activity
+                                            .requestedStatusBarHidden =
+                                            hidden;
+                                        activity
+                                            .setScrimToFinalState(
+                                                    hidden
+                                            );
+                                    } else {
+                                        activity
+                                            .setScrimToFinalState(
+                                                    activity
+                                                            .requestedStatusBarHidden
+                                            );
+                                    }
+                                }
+                            }
+                    );
+
+            activity.root.post(
+                    activity.root::requestApplyInsets
+            );
+        }
+
+        static void setHidden(
+                MainActivity activity,
+                boolean hidden
+        ) {
+            WindowInsetsController controller =
+                    activity.getWindow()
+                            .getInsetsController();
+
+            if (controller == null) {
+                activity.statusBarTransitionPending =
+                        false;
+                activity.actualStatusBarHidden = hidden;
+                activity.requestedStatusBarHidden = hidden;
+                activity.setScrimToFinalState(hidden);
+                return;
+            }
+
+            if (hidden) {
+                controller.hide(
+                        WindowInsets.Type.statusBars()
+                );
+            } else {
+                controller.show(
+                        WindowInsets.Type.statusBars()
+                );
+            }
+
+            /*
+             * Fallback for devices that don't dispatch a status-bar animation
+             * callback reliably. It moves only the overlay, never the WebView.
+             */
+            activity.root.postDelayed(() -> {
+                if (!activity
+                        .statusBarTransitionPending
+                        || activity
+                        .statusBarAnimationRunning) {
+                    return;
+                }
+
+                activity.statusBarTransitionPending =
+                        false;
+                activity.statusBarAnimationRunning =
+                        true;
+                activity.activeStatusBarAnimation =
+                        null;
+                activity.statusBarScrim
+                        .animate()
+                        .cancel();
+                activity.statusBarScrim
+                        .animate()
+                        .translationY(
+                                hidden
+                                        ? -activity
+                                        .statusBarOverlayHeight
+                                        : 0f
+                        )
+                        .setDuration(
+                                LEGACY_BAR_ANIMATION_MS
+                        )
+                        .setInterpolator(
+                                new DecelerateInterpolator()
+                        )
+                        .withEndAction(() -> {
+                            activity
+                                    .statusBarAnimationRunning =
+                                    false;
+
+                            WindowInsets currentInsets =
+                                    activity.root
+                                            .getRootWindowInsets();
+
+                            boolean finalHidden = hidden;
+                            if (currentInsets != null) {
+                                finalHidden =
+                                        !currentInsets.isVisible(
+                                                WindowInsets.Type
+                                                        .statusBars()
+                                        );
+                            }
+
+                            activity
+                                    .actualStatusBarHidden =
+                                    finalHidden;
+                            activity
+                                    .requestedStatusBarHidden =
+                                    finalHidden;
+                            activity
+                                    .setScrimToFinalState(
+                                            finalHidden
+                                    );
+                        })
+                        .start();
+            }, 48L);
+        }
+
+        static void remove(MainActivity activity) {
+            activity.root
+                    .setWindowInsetsAnimationCallback(null);
+            activity.root
+                    .setOnApplyWindowInsetsListener(null);
+        }
+
+        private static boolean isStatusBarAnimation(
+                WindowInsetsAnimation animation
+        ) {
+            return (
+                    animation.getTypeMask()
+                            & WindowInsets.Type
+                            .statusBars()
+            ) != 0;
+        }
+    }
+
+    /**
+     * API 33+ predictive-back registration is isolated for minSdk 26 safety.
+     */
+    private static final class Api33BackHandler {
+        private Api33BackHandler() {
+        }
+
+        static Object register(
+                Activity activity,
+                Runnable action
+        ) {
+            android.window.OnBackInvokedCallback callback =
+                    action::run;
+
+            activity.getOnBackInvokedDispatcher()
+                    .registerOnBackInvokedCallback(
+                            android.window
+                                    .OnBackInvokedDispatcher
+                                    .PRIORITY_DEFAULT,
+                            callback
+                    );
+
+            return callback;
+        }
+
+        static void unregister(
+                Activity activity,
+                Object callback
+        ) {
+            activity.getOnBackInvokedDispatcher()
+                    .unregisterOnBackInvokedCallback(
+                            (android.window
+                                    .OnBackInvokedCallback)
+                                    callback
+                    );
+        }
     }
 }
